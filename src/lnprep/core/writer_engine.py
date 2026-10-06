@@ -12,12 +12,18 @@ import os
 import re
 import shutil
 import tempfile
-import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# lxml rather than stdlib ElementTree: it round-trips a part with the namespace
+# prefixes and declarations the document already used. ElementTree renames any
+# namespace it does not know to ns0/ns1 and drops declarations that appear only in
+# attribute *values*, so a notes slide carrying markup-compatibility markup came back
+# as `ns1:Ignorable="a14"` with `xmlns:a14` gone and its comments deleted — invalid
+# references that make PowerPoint offer to repair the file.
+from lxml import etree as ET
 from pptx import Presentation
 
 from lnprep.core.common import (
@@ -656,7 +662,8 @@ def _inject_notes_into_xml(notes_text: str, xml_path: str, spec: Dict[str, Any],
     for p_node in paragraphs_to_add:
         tx_body.append(p_node)
 
-    tree.write(xml_path, xml_declaration=True, encoding='utf-8')
+    # standalone="yes" matches how every other part in the package is declared.
+    tree.write(xml_path, xml_declaration=True, encoding='UTF-8', standalone=True)
 
 
 def inject_notes(

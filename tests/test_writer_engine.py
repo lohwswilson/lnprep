@@ -1,11 +1,13 @@
 """Tests for writer_engine direct XML injection, backup, and payload parsing."""
 
 import os
+import re
 import shutil
 import tempfile
 import pytest
 from pptx import Presentation
 
+from lnprep.core import common
 from lnprep.core import writer_engine as we
 from lnprep.core.common import get_slide_notes_text
 
@@ -165,6 +167,44 @@ def test_backup_refreshed_when_content_changes_despite_older_mtime(sample_deck):
 def test_backup_reused_while_content_is_unchanged(sample_deck):
     """An unchanged deck must not accumulate a fresh multi-MB backup on every write."""
     assert we.backup_once(sample_deck) == we.backup_once(sample_deck)
+
+
+_PART_WITH_MC = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" xmlns:ink="http://schemas.microsoft.com/ink/2010/main" mc:Ignorable="a14 ink">
+  <!-- a comment that must survive -->
+  <p:cSld><p:spTree>
+    <p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/>
+      <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>old</a:t></a:r></a:p></p:txBody></p:sp>
+    <mc:AlternateContent><mc:Choice Requires="ink">
+      <p:sp><p:nvSpPr><p:cNvPr id="3" name="Ink"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>
+    </mc:Choice></mc:AlternateContent>
+  </p:spTree></p:cSld>
+</p:notes>
+'''
+
+
+def test_notes_part_round_trips_namespaces_and_comments(tmp_path):
+    """Re-serialising a part must preserve its namespace prefixes and comments.
+
+    Regression: stdlib ElementTree renamed unknown namespaces to ns0/ns1 and dropped
+    declarations used only in attribute values, so mc:Ignorable lost its xmlns:a14 and
+    mc:Choice lost its xmlns:ink — unresolved prefix references that make PowerPoint
+    offer to repair the file. Comments were deleted outright.
+    """
+    part = os.path.join(str(tmp_path), "notesSlide1.xml")
+    with open(part, "w", encoding="utf-8") as f:
+        f.write(_PART_WITH_MC)
+
+    we._inject_notes_into_xml(_notes("Injected here."), part, common.DEFAULT_FORMAT_SPEC, slide_num=1)
+    written = open(part, encoding="utf-8").read()
+
+    assert "Injected here." in written
+    assert "xmlns:a14=" in written
+    assert "xmlns:ink=" in written
+    assert "mc:Ignorable" in written
+    assert "<!-- a comment that must survive -->" in written
+    assert not re.search(r"<(ns0|ns1):", written)
+    assert "standalone='yes'" in written
 
 
 def test_empty_notes_are_rejected_and_the_deck_is_untouched(sample_deck):

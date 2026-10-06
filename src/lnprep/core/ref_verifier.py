@@ -370,12 +370,33 @@ def _fold(s: str) -> str:
     return "".join(c for c in s if not unicodedata.combining(c)).lower()
 
 
+def _parse_json_object(raw: bytes) -> Optional[Dict[str, Any]]:
+    """Decode a JSON *object* from a response body, or None.
+
+    A captive portal or corporate proxy can answer 200 with an HTML interstitial, and
+    a misconfigured mirror can return a bare array. Both used to escape as a
+    JSONDecodeError/AttributeError — the handler around check_doi catches only network
+    errors — and took the whole `verify`/`write` run down with a traceback.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _csl_years(m: Dict[str, Any]) -> Set[int]:
     years: Set[int] = set()
     for k in ("issued", "published-print", "published-online", "published"):
-        parts = (m.get(k) or {}).get("date-parts") or []
-        if parts and parts[0] and parts[0][0]:
-            years.add(int(parts[0][0]))
+        block = m.get(k)
+        if not isinstance(block, dict):
+            continue
+        parts = block.get("date-parts") or []
+        try:
+            if parts and parts[0] and parts[0][0]:
+                years.add(int(parts[0][0]))
+        except (TypeError, ValueError, IndexError):
+            continue
     return years
 
 
@@ -395,7 +416,8 @@ def check_doi(
             timeout=timeout,
         )
         if st == 200:
-            meta = json.loads(raw.decode("utf-8", "replace")).get("message")
+            parsed = _parse_json_object(raw)
+            meta = parsed.get("message") if parsed else None
         elif st not in (400, 404):
             return {"status": "UNREACHABLE", "detail": f"Crossref HTTP {st}"}
 
@@ -406,10 +428,7 @@ def check_doi(
                 timeout=timeout,
             )
             if st == 200:
-                try:
-                    meta = json.loads(raw.decode("utf-8", "replace"))
-                except json.JSONDecodeError:
-                    meta = None
+                meta = _parse_json_object(raw)
             elif st not in (400, 404):
                 return {"status": "UNREACHABLE", "detail": f"doi.org HTTP {st}"}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -422,7 +441,11 @@ def check_doi(
     title = title[0] if isinstance(title, list) and title else (title or "")
     container = meta.get("container-title")
     container = container[0] if isinstance(container, list) and container else (container or "")
-    families = [_fold(a.get("family") or a.get("name") or "") for a in meta.get("author", []) or []]
+    families = [
+        _fold(a.get("family") or a.get("name") or "")
+        for a in (meta.get("author") or [])
+        if isinstance(a, dict)
+    ]
     years = _csl_years(meta)
     ev = {
         "title": title,

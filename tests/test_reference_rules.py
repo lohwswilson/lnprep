@@ -169,6 +169,34 @@ def test_gate_blocks_when_the_network_is_unreachable(monkeypatch):
         shutil.rmtree(deck_dir, ignore_errors=True)
 
 
+def test_check_doi_survives_non_json_and_malformed_payloads(monkeypatch):
+    """A proxy or captive portal can answer 200 with HTML, and a mirror can return a
+    bare array. Both used to escape as JSONDecodeError/AttributeError — the handler
+    around check_doi catches only network errors — and killed the whole run."""
+    for body in (
+        b"<html><body>Sign in to WiFi</body></html>",   # captive portal interstitial
+        b'["not", "an", "object"]',                      # array, not an object
+        b"{trailing comma,}",                            # malformed
+        b"",                                             # empty
+    ):
+        monkeypatch.setattr(vr, "_fetch", lambda *a, _b=body, **k: (200, "https://x/", "text/html", _b))
+        res = vr.check_doi("10.1234/abc", author="Chor", year="2023")
+        assert res["status"] == "NOT_FOUND", body
+
+    # A well-formed record still resolves.
+    good = b'{"message":{"title":["T"],"author":[{"family":"Chor"}],"issued":{"date-parts":[[2023]]}}}'
+    monkeypatch.setattr(vr, "_fetch", lambda *a, **k: (200, "https://x/", "application/json", good))
+    assert vr.check_doi("10.1234/abc", author="Chor", year="2023")["status"] == "VERIFIED"
+
+
+def test_csl_years_tolerates_malformed_date_blocks():
+    """`(m.get(k) or {}).get(...)` raised whenever a CSL date field was not an object."""
+    assert vr._csl_years({"issued": ["not", "a", "dict"]}) == set()
+    assert vr._csl_years({"issued": {"date-parts": [["nonsense"]]}}) == set()
+    assert vr._csl_years({"issued": {"date-parts": [[2023, 5]]}}) == {2023}
+    assert vr._csl_years({"issued": None}) == set()
+
+
 def test_check_url_refuses_private_loopback_and_metadata_hosts():
     """Notes are often LLM-authored, so a URL in them is untrusted input.
 
