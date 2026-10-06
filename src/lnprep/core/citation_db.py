@@ -9,12 +9,17 @@ import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from lnprep.config import CACHE_FILENAME, DEFAULT_TTL_DAYS
 
 SCHEMA_VERSION = 1
+
+
+class CacheUnreadableError(RuntimeError):
+    """The cache file exists but cannot be parsed, so it must not be rewritten."""
 
 _AND = re.compile(r"\s*(?:&|\band\b|,)\s*", re.I)
 _NONWORD = re.compile(r"[^a-z0-9 ]")
@@ -33,13 +38,21 @@ def normalise_key(author: Any, year: Any) -> str:
 
 
 def find_module_root(pptx_path: Optional[str] = None, override: Optional[str] = None) -> str:
-    """Locate the module root folder containing LECTURE_NOTES_GUIDE.md."""
+    """Locate the module root folder containing LECTURE_NOTES_GUIDE.md.
+
+    Accepts either a deck inside the module or the module folder itself. A folder
+    argument used to be resolved from its *parent*, so `cache record <module>` wrote
+    a cache beside the course directory while `verify`/`write` read one inside it —
+    the two halves silently disagreed.
+    """
     if override:
         return os.path.abspath(override)
     if not pptx_path:
         return os.path.abspath(os.getcwd())
 
-    current = os.path.dirname(os.path.abspath(pptx_path))
+    start = os.path.abspath(pptx_path)
+    current = start if os.path.isdir(start) else os.path.dirname(start)
+    fallback = current
     for _ in range(5):
         if os.path.exists(os.path.join(current, "LECTURE_NOTES_GUIDE.md")):
             return current
@@ -47,7 +60,7 @@ def find_module_root(pptx_path: Optional[str] = None, override: Optional[str] = 
         if parent == current:
             break
         current = parent
-    return os.path.dirname(os.path.abspath(pptx_path))
+    return fallback
 
 
 def cache_path(module_root: str) -> str:
@@ -61,7 +74,7 @@ def now_iso() -> str:
 def parse_iso(s: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(s)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
 
 
@@ -95,15 +108,17 @@ def load(module_root: str) -> Dict[str, Any]:
     try:
         with open(p, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        if not isinstance(data, dict) or "citations" not in data:
-            raise ValueError("malformed cache")
+        if not isinstance(data, dict):
+            raise ValueError("cache root is not an object")
+        if "citations" in data and not isinstance(data["citations"], dict):
+            raise ValueError("'citations' is not an object")
         data.setdefault("schema_version", SCHEMA_VERSION)
         data.setdefault("citations", {})
         return data
     except (json.JSONDecodeError, ValueError, OSError) as exc:
+        message = f"{CACHE_FILENAME} unreadable ({exc.__class__.__name__}: {exc})"
         sys.stderr.write(
-            f"WARNING: {CACHE_FILENAME} unreadable ({exc.__class__.__name__}); "
-            f"treating as empty. No cached citation will be served.\n"
+            f"WARNING: {message}; treating as empty. No cached citation will be served.\n"
         )
         return {
             "schema_version": SCHEMA_VERSION,
@@ -111,17 +126,34 @@ def load(module_root: str) -> Dict[str, Any]:
             "created": now_iso(),
             "citations": {},
             "_load_failed": True,
+            "load_error": message,
         }
 
 
 def save(module_root: str, data: Dict[str, Any]) -> str:
-    """Save cache atomically."""
+    """Save the cache atomically.
+
+    A unique temp name plus fsync before os.replace, so two concurrent runs cannot
+    interleave into one temp file and a crash cannot leave a truncated cache where a
+    valid one stood.
+    """
     p = cache_path(module_root)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, p)
+    directory = os.path.dirname(p) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".citation_cache-", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return p
 
 
@@ -222,16 +254,29 @@ def log_hit(module_root: str, author: str, year: Any) -> int:
 
 
 def prune(module_root: str, ttl_days: int = DEFAULT_TTL_DAYS, now: Optional[datetime] = None) -> Tuple[int, int, List[str]]:
-    """Prune expired entries from cache. Returns (dropped_count, keep_count, dropped_keys)."""
+    """Prune expired entries. Returns (dropped_count, kept_count, dropped_keys).
+
+    Refuses to touch an unreadable cache: rewriting it would discard every entry it
+    holds, and the previous version persisted the `_load_failed` sentinel to disk,
+    which bricked the cache permanently. It also prunes by the stored key rather than
+    re-deriving one from the entry's author/year, which silently dropped any entry
+    whose key no longer round-tripped.
+    """
     data = load(module_root)
+    if data.get("_load_failed"):
+        raise CacheUnreadableError(
+            f"{data.get('load_error', 'cache unreadable')}. Refusing to prune: that would "
+            f"discard every entry. Inspect or delete {cache_path(module_root)} and retry."
+        )
+
     now = now or datetime.now(timezone.utc).astimezone()
     keep: Dict[str, Any] = {}
     dropped: List[str] = []
 
-    for key, e in data.get("citations", {}).items():
-        status, _, _ = lookup(data, e.get("author", ""), e.get("year", ""), ttl_days=ttl_days, now=now)
-        if status == "HIT_FRESH":
-            keep[key] = e
+    for key, entry in data.get("citations", {}).items():
+        age = age_days(entry, now)
+        if age is not None and (ttl_days - age) > 0:
+            keep[key] = entry
         else:
             dropped.append(key)
 
@@ -250,7 +295,12 @@ def get_report_data(module_root: str, ttl_days: int = DEFAULT_TTL_DAYS, now: Opt
     rows: List[Dict[str, Any]] = []
 
     for key, e in sorted(cits.items()):
-        status, _, left = lookup(data, e.get("author", ""), e.get("year", ""), ttl_days=ttl_days, now=now)
+        age = age_days(e, now)
+        if age is None:
+            status, left = "HIT_STALE", None
+        else:
+            left = ttl_days - age
+            status = "HIT_FRESH" if left > 0 else "HIT_STALE"
         if status == "HIT_FRESH":
             fresh += 1
         else:
@@ -260,7 +310,9 @@ def get_report_data(module_root: str, ttl_days: int = DEFAULT_TTL_DAYS, now: Opt
             "author": e.get("author", "?"),
             "year": e.get("year", "?"),
             "verified_at": (e.get("verified_at") or "")[:10],
-            "days_left": round(left, 1) if left is not None and status == "HIT_FRESH" else "STALE",
+            # A stale row has no meaningful "days left"; report it as absent rather
+            # than as a string the callers then fed to abs().
+            "days_left": round(left, 1) if left is not None else None,
             "hits": e.get("hits", 0),
             "title": e.get("title", ""),
             "doi": e.get("doi", ""),
@@ -276,5 +328,7 @@ def get_report_data(module_root: str, ttl_days: int = DEFAULT_TTL_DAYS, now: Opt
         "total": len(cits),
         "fresh": fresh,
         "stale": stale,
+        "unreadable": bool(data.get("_load_failed")),
+        "load_error": data.get("load_error", ""),
         "entries": rows,
     }

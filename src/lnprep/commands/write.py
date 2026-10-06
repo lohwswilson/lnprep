@@ -13,15 +13,16 @@ from typing import List, Optional, Tuple
 import typer
 from rich.table import Table
 
-from lnprep.console import console, print_error, print_formatted, print_info, print_success
-from lnprep.core import ref_verifier as vr
-from lnprep.core.writer_engine import (
-    backup_once,
-    batch_update_notes,
-    ensure_local_copy,
-    load_notes_payload,
-    sync_back,
+from lnprep.console import (
+    console,
+    print_error,
+    print_formatted,
+    print_info,
+    print_success,
+    print_warning,
 )
+from lnprep.core import ref_verifier as vr
+from lnprep.core.writer_engine import apply_notes, load_notes_payload
 
 app = typer.Typer(help="Write notes to PPTX slides via Direct XML injection with backup and gate")
 
@@ -129,24 +130,24 @@ def write_command(
             print_error("Write-back cancelled by reference verification gate.")
         raise typer.Exit(code=1)
 
-    # Backup & staging
-    backup_file = None
-    if not no_backup:
-        backup_file = backup_once(str(pptx_path))
-        if not as_json and backup_file:
-            print_info(f"Backup verified → {backup_file}")
+    if no_backup and not as_json:
+        print_warning("--no-backup: no restore point will be created for this write.")
 
-    ensure_local_copy(str(pptx_path))
+    # Safe write: verified backup -> staged injection -> atomic publish
+    try:
+        res = apply_notes(str(pptx_path), entries, backup=not no_backup)
+    except Exception as exc:
+        if as_json:
+            print_formatted({"success": False, "message": str(exc)}, as_json=True)
+        else:
+            print_error(str(exc))
+        raise typer.Exit(code=1)
 
-    # Perform XML injection
-    res = batch_update_notes(str(pptx_path), entries)
-
-    # Sync back to original file
-    sync_back(str(pptx_path))
+    backup_file = res.get("backup")
+    if not as_json and backup_file:
+        print_info(f"Backup verified → {backup_file}")
 
     if as_json:
-        res["success"] = True
-        res["backup"] = backup_file
         print_formatted(res, as_json=True)
         return
 

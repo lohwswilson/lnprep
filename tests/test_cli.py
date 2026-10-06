@@ -188,8 +188,61 @@ def test_cli_brief(test_environment):
 def test_cli_check(test_environment):
     deck = test_environment["deck"]
     res = runner.invoke(app, ["check", deck, "--json"])
-    # May pass or fail depending on complete quality markers, but exits with structured JSON
     data = json.loads(res.stdout)
     assert "audit" in data
     assert "references" in data
+
+    # The fixture deck has body text but no notes at all, so the audit half must fail
+    # and the gate must report it. Previously audit_failures was always 0 here and the
+    # command exited 0 on any deck, whatever state it was in.
+    assert data["pass"] is False
+    assert data["audit"]["failures"] >= 1
+    assert res.exit_code == 1
+
+
+def test_cli_audit_summary_is_populated(test_environment):
+    """Regression: run_audit returned no 'summary', so this table printed all zeros."""
+    res = runner.invoke(app, ["audit", test_environment["deck"], "--json"])
+    assert res.exit_code == 0
+    summary = json.loads(res.stdout)["summary"]
+    assert sum(summary.values()) == 1
+    assert summary["no_notes"] == 1
+
+
+def _write_guide_module(tmp_dir):
+    session = os.path.join(tmp_dir, "MO9529.Demo", "Session_1")
+    os.makedirs(session)
+    with open(os.path.join(session, "LECTURE_NOTES_GUIDE.md"), "w") as f:
+        f.write(
+            "# Guide\n\n## Session Identity\n\n```yaml\nmodule_code: \"MO9529\"\n"
+            "duration: \"180 min\"\n```\n\n## Suggested Session Flow\n\n"
+            "### Block 1 — Opening (30 min)\n\n## Formatting & Notes Rules\n\n- x\n"
+        )
+    open(os.path.join(session, "Orphan.pptx"), "w").close()
+    return os.path.join(tmp_dir, "MO9529.Demo")
+
+
+def test_cli_cross_check_reports_failure_and_exits_nonzero():
+    """Regression: the command always printed 'status: UNKNOWN' and exited 0, even
+    when the guide's time budget and its file references had both failed."""
+    tmp_dir = tempfile.mkdtemp(prefix="lnprep-cc-test-")
+    try:
+        module = _write_guide_module(tmp_dir)
+        res = runner.invoke(app, ["cross-check", module, "--json"])
+        data = json.loads(res.stdout)
+
+        assert data["status"] == "FAIL"
+        assert res.exit_code == 1
+        assert data["sessions"]["Session_1"]["budget"]["status"] == "FAIL"
+        assert data["sessions"]["Session_1"]["deck"]["status"] == "FAIL"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_cli_cross_check_rejects_an_unknown_check_name():
+    """An unrecognised --check value used to match no branch and silently run nothing."""
+    result = runner.invoke(app, ["cross-check", os.getcwd(), "--check", "nonsense"])
+    assert result.exit_code == 2
+    combined = result.stdout + getattr(result, "stderr", "")
+    assert "Unknown --check value" in combined
 

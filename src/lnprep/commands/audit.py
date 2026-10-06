@@ -11,7 +11,7 @@ import typer
 from rich.table import Table
 
 from lnprep.console import console, print_formatted, print_success
-from lnprep.core.audit_engine import run_audit
+from lnprep.core.audit_engine import AUDIT_STATUSES, run_audit
 
 app = typer.Typer(help="Audit lecture notes for SBC coverage, alignment, quality, and depth")
 
@@ -94,17 +94,22 @@ def audit_command(
     sum_table.add_column("Count", justify="right")
     sum_table.add_column("Description")
 
-    status_styles = {
-        "PASS": ("green", "Full coverage, aligned, ≥5/6 quality markers"),
+    status_desc = {
+        "PASS": ("green", "Full coverage, aligned, quality and depth bars met"),
         "GAPS": ("yellow", "Slide body items missing in SBC section"),
         "MISALIGNED": ("red", "Vocabulary differs significantly from slide"),
         "WEAK_QUALITY": ("red", "Fails 6-marker quality floor"),
+        "SHALLOW_DEPTH": ("red", "SBC fields present but below the paragraph/depth bar"),
+        "WEAK_ZONE_A": ("red", "Zone A KEY POINT present but below the depth bar"),
+        "UNSOURCED_EXAMPLES": ("red", "Concrete Example carries no source"),
         "UNPARSED_SBC": ("red", "SBC section exists but cannot be parsed"),
         "NO_SBC": ("red", "Missing Slide Body Coverage block"),
+        "NO_NOTES": ("red", "Slide has no notes at all"),
         "SKIPPED": ("dim", "Chrome/title slide without substantive body"),
     }
 
-    for st, (style, desc) in status_styles.items():
+    for st in AUDIT_STATUSES:
+        style, desc = status_desc.get(st, ("white", ""))
         cnt = summary.get(st.lower(), 0)
         sum_table.add_row(f"[{style}]{st}[/{style}]", str(cnt), desc)
 

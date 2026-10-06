@@ -10,6 +10,23 @@ from lnprep.core import writer_engine as we
 from lnprep.core.common import get_slide_notes_text
 
 
+def _notes(text: str = "A valid key point sentence for testing.") -> str:
+    return (
+        "--- SPEAKER NOTES ---\n"
+        f"KEY POINT: {text}\n\n"
+        "--- LECTURE NOTES ---\n"
+        "Core Narrative: Body text.\n"
+    )
+
+
+def _write_deck(path: str, titles) -> None:
+    prs = Presentation()
+    for title in titles:
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.title.text = title
+    prs.save(path)
+
+
 @pytest.fixture
 def sample_deck():
     tmp_dir = tempfile.mkdtemp(prefix="lnprep-test-deck-")
@@ -90,3 +107,71 @@ Plain English: Every delay compounds as orders travel upstream.
     assert "--- VISUAL DECONSTRUCTION ---" in read_back
     assert "--- LECTURE NOTES ---" in read_back
     assert "Supply Chain Friction" in read_back
+
+
+def test_write_preserves_an_externally_edited_deck(sample_deck):
+    """A deck edited in PowerPoint between two writes must not be reverted.
+
+    Regression: the engine cached its working copy at a fixed /tmp path keyed on
+    the deck's *path* and reused it whenever it still existed, so a later write
+    republished that stale copy and destroyed edits made in between.
+    """
+    we.update_slide(sample_deck, 1, _notes())
+
+    _write_deck(sample_deck, ["Introduction", "Core Principles", "USER ADDED SLIDE"])
+    assert len(Presentation(sample_deck).slides) == 3
+
+    res = we.update_slide(sample_deck, 2, _notes())
+    assert res["updated"] == 1
+
+    titles = [s.shapes.title.text for s in Presentation(sample_deck).slides]
+    assert titles == ["Introduction", "Core Principles", "USER ADDED SLIDE"]
+
+
+def test_publish_refuses_when_the_deck_changes_mid_write(sample_deck):
+    """The original must not be replaced if it changed while notes were being written."""
+    staging = we.begin_staging(sample_deck)
+    try:
+        we.inject_notes(staging.deck, [(1, _notes())])
+        _write_deck(sample_deck, ["Introduction", "Core Principles", "CHANGED UNDERNEATH"])
+
+        with pytest.raises(RuntimeError, match="changed on disk"):
+            we.publish_staged(staging)
+    finally:
+        we.discard_staging(staging)
+
+    titles = [s.shapes.title.text for s in Presentation(sample_deck).slides]
+    assert titles == ["Introduction", "Core Principles", "CHANGED UNDERNEATH"]
+
+
+def test_backup_refreshed_when_content_changes_despite_older_mtime(sample_deck):
+    """Backup freshness must be decided by content, not mtime.
+
+    Copy-based restores (cp -p, rsync -a, Drive, Time Machine, git checkout) all
+    preserve mtime, so an mtime test treats a *replaced* deck as already backed up
+    and leaves the only backup predating the file it was meant to protect.
+    """
+    first = we.backup_once(sample_deck)
+
+    _write_deck(sample_deck, ["REPLACEMENT DECK"])
+    older = os.path.getmtime(first) - 3600
+    os.utime(sample_deck, (older, older))
+
+    second = we.backup_once(sample_deck)
+    assert second != first
+    assert [s.shapes.title.text for s in Presentation(second).slides] == ["REPLACEMENT DECK"]
+
+
+def test_backup_reused_while_content_is_unchanged(sample_deck):
+    """An unchanged deck must not accumulate a fresh multi-MB backup on every write."""
+    assert we.backup_once(sample_deck) == we.backup_once(sample_deck)
+
+
+def test_empty_notes_are_rejected_and_the_deck_is_untouched(sample_deck):
+    """An empty payload used to erase a slide's existing notes and still exit 0."""
+    before = open(sample_deck, "rb").read()
+
+    with pytest.raises(ValueError, match="Refusing to write empty notes"):
+        we.update_slide(sample_deck, 1, "   \n  ")
+
+    assert open(sample_deck, "rb").read() == before

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -724,6 +724,36 @@ def audit_cadence(prs: Any, cfg: Optional[Dict[str, Any]] = None) -> Optional[Di
     }
 
 
+# Every status audit_slide can emit. Callers should treat anything outside
+# ("PASS", "SKIPPED") as a finding rather than allow-listing individual statuses —
+# an allow-list silently drops statuses added later.
+AUDIT_STATUSES = (
+    "PASS",
+    "GAPS",
+    "MISALIGNED",
+    "WEAK_QUALITY",
+    "SHALLOW_DEPTH",
+    "WEAK_ZONE_A",
+    "UNSOURCED_EXAMPLES",
+    "UNPARSED_SBC",
+    "NO_SBC",
+    "NO_NOTES",
+    "SKIPPED",
+)
+
+# Depth verdicts that mean "the writing is too thin", as opposed to "the field is absent".
+_DEPTH_FAILURES = ("BELOW_DEPTH", "NOT_PROSE", "OVER_MAX_PARAGRAPHS")
+
+
+def summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Count slides per status, keyed lowercase."""
+    counts = {status.lower(): 0 for status in AUDIT_STATUSES}
+    for result in results:
+        key = str(result.get("status", "")).lower()
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def audit_slide(
     slide: Any,
     slide_num: int,
@@ -775,6 +805,9 @@ def audit_slide(
     example_sources = audit_example_sources(lecture_text, cfg)
     formatting = audit_formatting(slide, cfg)
 
+    # Every pass below is computed above; each one that can judge the notes must be
+    # able to fail them. Depth, Zone A depth and example sourcing used to be computed
+    # and then ignored, so a slide whose six SBC fields each held one word scored PASS.
     if not sbc_block:
         overall = "NO_SBC"
     elif quality["status"] == "NO_ITEMS_PARSED":
@@ -783,6 +816,12 @@ def audit_slide(
         overall = "MISALIGNED"
     elif quality["status"] in ("WEAK", "FAIL"):
         overall = "WEAK_QUALITY"
+    elif depth["status"] in _DEPTH_FAILURES:
+        overall = "SHALLOW_DEPTH"
+    elif zone_a_depth["status"] in _DEPTH_FAILURES:
+        overall = "WEAK_ZONE_A"
+    elif example_sources["status"] == "EXAMPLE_UNSOURCED":
+        overall = "UNSOURCED_EXAMPLES"
     elif coverage and coverage["missing"] > 0:
         overall = "GAPS"
     else:
@@ -835,6 +874,7 @@ def run_audit(
         "total_slides": len(results),
         "threshold": threshold,
         "min_overlap": min_overlap,
+        "summary": summarise_results(results),
         "cadence": audit_cadence(prs, cfg),
         "format_spec": {
             "found": report["found"],

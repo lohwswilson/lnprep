@@ -324,9 +324,33 @@ def cross_check_module(module_root: str, only: Optional[str] = None) -> Dict[str
             if only in (None, "reading"):
                 sessions[label]["reading"] = check_linkage(folder, md, "reading", (".pdf",), recurse=True)
 
+    # Roll the individual checks up into one verdict. Without this the caller had no
+    # top-level status to read, so the CLI always reported "UNKNOWN" and exited 0 even
+    # when the budget and the file references had both failed.
+    statuses: List[str] = []
+    for sess in sessions.values():
+        if isinstance(sess, dict) and sess.get("status") == NOT_CHECKABLE:
+            statuses.append(NOT_CHECKABLE)
+        for key in ("budget", "deck", "reading"):
+            chk = sess.get(key) if isinstance(sess, dict) else None
+            if isinstance(chk, dict):
+                statuses.append(str(chk.get("status", "")))
+
+    for chk in checks.values():
+        if isinstance(chk, dict):
+            statuses.append(str(chk.get("status", "")))
+
+    if any(s == FAIL for s in statuses):
+        overall = FAIL
+    elif any(s and s != NOT_CHECKABLE for s in statuses):
+        overall = OK
+    else:
+        overall = NOT_CHECKABLE
+
     return {
         "module": os.path.basename(module_root),
         "module_root": module_root,
+        "status": overall,
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "sessions": sessions,
         "legacy_guides": legacy,

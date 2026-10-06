@@ -7,6 +7,7 @@ Connects with Crossref, OpenLibrary, doi.org, and local citation cache.
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import os
 import re
@@ -29,7 +30,18 @@ from lnprep.config import (
     OVERRIDE_LOG,
 )
 
-BLOCKING = ("MISMATCH", "NOT_FOUND", "BROKEN_LINK", "EPHEMERAL_URL", "NO_SOURCE", "UNRESOLVED")
+# UNREACHABLE is blocking on purpose. A transport failure means the check never
+# happened, so treating it as non-blocking let an offline machine, a captive
+# portal, or a Crossref 429 pass the gate exactly like a verified citation.
+BLOCKING = (
+    "MISMATCH",
+    "NOT_FOUND",
+    "BROKEN_LINK",
+    "EPHEMERAL_URL",
+    "NO_SOURCE",
+    "UNRESOLVED",
+    "UNREACHABLE",
+)
 PASSING = ("VERIFIED", "CACHED")
 
 SBC_LABELS = [
@@ -263,24 +275,94 @@ def check_example_sourcing(notes: str, labels: Optional[List[str]] = None) -> Li
     return out
 
 
+class BlockedFetchError(OSError):
+    """A URL was not fetched because it targets a private address, or redirected to one."""
+
+
+_ALLOWED_SCHEMES = ("http", "https")
+_BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa", ".localdomain")
+_MAX_REDIRECTS = 5
+
+
+def _is_public_host(host: str) -> bool:
+    """False for loopback, private, link-local, CGNAT or internal hostnames.
+
+    A URL reaching this function is untrusted input — slide notes are frequently
+    LLM-written or LLM-enriched. Without the check a note could make the tool fetch
+    http://127.0.0.1:<port>/ or the cloud metadata address and echo the page title
+    back through the console, the JSON output and the review brief.
+    """
+    name = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not name or name == "localhost" or name.endswith(_BLOCKED_HOST_SUFFIXES):
+        return False
+    try:
+        infos = socket.getaddrinfo(name, None)
+    except OSError:
+        return True  # unresolvable — let the request fail on its own terms
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if not addr.is_global or addr.is_multicast:
+            return False
+    return True
+
+
+def _url_is_fetchable(url: str) -> Tuple[bool, str]:
+    """Check the scheme and host before any connection is opened."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as exc:
+        return False, f"unparseable URL ({exc})"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return False, f"unsupported scheme {scheme or '(none)'!r}"
+    if not _is_public_host(parts.hostname or ""):
+        return False, "host resolves to a private, loopback or link-local address"
+    return True, ""
+
+
 def _fetch(
     url: str,
     accept: Optional[str] = None,
     ua: str = BROWSER_UA,
     timeout: int = DEFAULT_HTTP_TIMEOUT,
 ) -> Tuple[int, str, str, bytes]:
-    """GET url -> (status, final_url, content_type, text)."""
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": ua, "Accept": accept or "text/html,*/*;q=0.8"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            ctype = r.headers.get("Content-Type", "")
-            raw = r.read(MAX_DOWNLOAD_BYTES)
-            return r.status, r.geturl(), ctype, raw
-    except urllib.error.HTTPError as e:
-        return e.code, url, e.headers.get("Content-Type", "") if e.headers else "", b""
+    """GET url -> (status, final_url, content_type, text).
+
+    Redirects are followed by hand so every hop can be checked against the private
+    address blocklist. urllib's default handler will follow a public URL straight
+    into 127.0.0.1 or 169.254.169.254 without a second look.
+    """
+    allowed, why = _url_is_fetchable(url)
+    if not allowed:
+        raise BlockedFetchError(why)
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    current = url
+    for _ in range(_MAX_REDIRECTS):
+        req = urllib.request.Request(
+            current,
+            headers={"User-Agent": ua, "Accept": accept or "text/html,*/*;q=0.8"},
+        )
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                ctype = r.headers.get("Content-Type", "")
+                raw = r.read(MAX_DOWNLOAD_BYTES)
+                return r.status, r.geturl(), ctype, raw
+        except urllib.error.HTTPError as e:
+            headers = e.headers
+            location = headers.get("Location") if headers else None
+            if e.code in (301, 302, 303, 307, 308) and location:
+                nxt = urllib.parse.urljoin(current, location)
+                hop_ok, hop_why = _url_is_fetchable(nxt)
+                if not hop_ok:
+                    raise BlockedFetchError(f"redirect to a blocked address: {hop_why}") from e
+                current = nxt
+                continue
+            return e.code, current, (headers.get("Content-Type", "") if headers else ""), b""
+    raise BlockedFetchError(f"more than {_MAX_REDIRECTS} redirects")
 
 
 def _fold(s: str) -> str:
@@ -456,10 +538,15 @@ def check_url(
     numbers: Optional[List[str]] = None,
     timeout: int = DEFAULT_HTTP_TIMEOUT,
 ) -> Dict[str, Any]:
+    allowed, why = _url_is_fetchable(url)
+    if not allowed:
+        return {"status": "BROKEN_LINK", "detail": f"refused to fetch: {why}"}
     if any(p in url for p in _EPHEMERAL):
         return _ephemeral_result(url, timeout)
     try:
         st, final, ctype, raw = _fetch(url, timeout=timeout)
+    except BlockedFetchError as e:
+        return {"status": "BROKEN_LINK", "detail": f"refused to fetch: {e}"}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         reason = getattr(e, "reason", e)
         if ("Name or service not known" in str(reason) or "nodename nor servname" in str(reason)) and _online():
@@ -477,6 +564,13 @@ def check_url(
         return {"status": "UNREACHABLE", "detail": f"HTTP {st}"}
     if st >= 400:
         return {"status": "BROKEN_LINK", "detail": f"HTTP {st}"}
+    # Fail closed on anything that is not a real 2xx page. A 3xx that fell out of the
+    # redirect loop, and a 2xx with an empty body, both used to drop through to the
+    # VERIFIED return below and were then written into the cache for 180 days.
+    if not 200 <= st < 300:
+        return {"status": "UNREACHABLE", "detail": f"HTTP {st} — no page to verify"}
+    if not raw:
+        return {"status": "UNREACHABLE", "detail": f"HTTP {st} with an empty body — nothing to verify"}
 
     parsed = _page_text(raw, ctype)
     if parsed is None:
@@ -833,4 +927,11 @@ def gate(
             f"   rerun with --allow-unverified to override (logged).",
             file=out,
         )
+        unreachable = sum(1 for f in rep["findings"] if f.get("status") == "UNREACHABLE")
+        if unreachable:
+            print(
+                f"   {unreachable} could not be checked at all: the network was unreachable "
+                f"(offline, timeout, rate limit, or proxy). Retry when back online.",
+                file=out,
+            )
     return False

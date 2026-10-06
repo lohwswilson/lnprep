@@ -11,8 +11,10 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -46,65 +48,154 @@ def _hash_path(path: str) -> str:
     return hashlib.md5(path.encode()).hexdigest()[:6]
 
 
-def get_tmp_path(pptx_path: str) -> str:
-    base = os.path.basename(pptx_path).replace(" ", "_")
-    h = _hash_path(pptx_path)
-    return f"/tmp/pptx_working_{base}_{h}.pptx"
-
-
 def get_backup_marker(pptx_path: str) -> str:
     base = os.path.basename(pptx_path).replace(" ", "_")
     h = _hash_path(pptx_path)
     return f"/tmp/pptx_backup_done_{base}_{h}"
 
 
-def get_unzip_dir(pptx_path: str) -> str:
-    base = os.path.basename(pptx_path).replace(" ", "_")
-    h = _hash_path(pptx_path)
-    return f"/tmp/unzipped_slide_update_{base}_{h}"
+def file_fingerprint(path: str) -> str:
+    """SHA-256 of the file's bytes — the only safe test of whether a deck changed."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def ensure_local_copy(pptx_path: str) -> str:
-    """Copy from original location to /tmp working path."""
-    tmp = get_tmp_path(pptx_path)
-    if not os.path.exists(tmp):
-        shutil.copy2(pptx_path, tmp)
-    return tmp
+def deck_opens(path: str) -> bool:
+    """True if python-pptx can open the file. A backup that will not open is worthless."""
+    try:
+        Presentation(path)
+        return True
+    except Exception:
+        return False
+
+
+def _atomic_publish(src: str, dst: str) -> None:
+    """Replace dst with src atomically: same-directory temp file, fsync, os.replace.
+
+    A plain copy truncates dst before writing it, so an interrupt mid-copy leaves
+    a truncated deck that PowerPoint refuses to open.
+    """
+    dst = os.path.abspath(dst)
+    dst_dir = os.path.dirname(dst) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".lnprep-", suffix=".pptx.tmp", dir=dst_dir)
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        with open(tmp, "rb+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@dataclass
+class Staging:
+    """A private staging copy of one deck, owned by a single write invocation."""
+
+    source: str
+    root: str
+    deck: str
+    fingerprint: str
+
+
+def begin_staging(pptx_path: str) -> Staging:
+    """Stage a working copy in a fresh private directory for this invocation.
+
+    Scratch state used to live at a fixed /tmp path and was reused whenever it
+    existed, so a run days later published that stale copy over a deck the user
+    had since edited in PowerPoint.
+    """
+    source = os.path.abspath(pptx_path)
+    root = tempfile.mkdtemp(prefix="lnprep-stage-")
+    deck = os.path.join(root, os.path.basename(source))
+    fingerprint = file_fingerprint(source)
+    shutil.copy2(source, deck)
+    return Staging(source=source, root=root, deck=deck, fingerprint=fingerprint)
+
+
+def publish_staged(staging: Staging) -> None:
+    """Atomically move the staged deck onto the original.
+
+    Refuses if the original changed since staging began: publishing would
+    silently discard an edit made while the notes were being prepared.
+    """
+    if not os.path.exists(staging.source):
+        raise FileNotFoundError(f"Original deck disappeared during write: {staging.source}")
+    if file_fingerprint(staging.source) != staging.fingerprint:
+        raise RuntimeError(
+            f"{os.path.basename(staging.source)} changed on disk while notes were being "
+            "written, so publishing would discard those changes. Re-run the command to "
+            "pick up the current version."
+        )
+    _atomic_publish(staging.deck, staging.source)
+
+
+def discard_staging(staging: Staging) -> None:
+    """Remove the staging directory."""
+    shutil.rmtree(staging.root, ignore_errors=True)
+
+
+def _read_backup_marker(marker: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(marker):
+        return None
+    try:
+        with open(marker, "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"path": raw, "sha256": ""}  # legacy plain-path marker: no hash, never trusted
+    return data if isinstance(data, dict) else None
 
 
 def backup_once(pptx_path: str) -> str:
-    """Create ONE backup per session, auto-invalidating on modification or >24h."""
+    """Return a verified backup, creating one only when the deck's content changed.
+
+    Freshness is decided by content hash. The previous mtime test treated a
+    replaced deck as already backed up whenever the replacement's mtime was equal
+    or older — which every copy-based restore preserves (cp -p, rsync -a,
+    Drive/Time Machine, git checkout) — so the only backup on disk could predate
+    the very file it was meant to protect.
+    """
+    fingerprint = file_fingerprint(pptx_path)
     marker = get_backup_marker(pptx_path)
-    needs_backup = True
-    existing_backup = ""
-    if os.path.exists(marker):
-        try:
-            with open(marker, "r", encoding="utf-8") as f:
-                existing_backup = f.read().strip()
-            if existing_backup and os.path.exists(existing_backup) and os.path.exists(pptx_path):
-                src_mtime = os.path.getmtime(pptx_path)
-                b_mtime = os.path.getmtime(existing_backup)
-                if (src_mtime <= b_mtime + 2) and (
-                    datetime.now() - datetime.fromtimestamp(b_mtime)
-                ).total_seconds() < 86400:
-                    needs_backup = False
-        except Exception:
-            needs_backup = True
 
-    if needs_backup:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = pptx_path.replace(".pptx", f"_backup_{ts}.pptx")
-        shutil.copy2(pptx_path, backup)
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(backup)
-        return backup
-    return existing_backup
+    previous = _read_backup_marker(marker)
+    if previous:
+        path = previous.get("path") or ""
+        if (
+            previous.get("sha256") == fingerprint
+            and path
+            and os.path.exists(path)
+            and deck_opens(path)
+        ):
+            return path
 
+    root, ext = os.path.splitext(pptx_path)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = f"{root}_backup_{ts}{ext}"
+    shutil.copy2(pptx_path, backup)
+    if not deck_opens(backup):
+        raise RuntimeError(f"Backup failed verification (cannot be opened): {backup}")
 
-def sync_back(pptx_path: str) -> None:
-    """Copy local working file back to target PPTX path."""
-    tmp = get_tmp_path(pptx_path)
-    shutil.copy2(tmp, pptx_path)
+    try:
+        with open(marker, "w", encoding="utf-8") as handle:
+            json.dump({"path": backup, "sha256": fingerprint}, handle)
+    except OSError:
+        pass
+    return backup
 
 
 def create_p(space_before_pts: int = 100, level: Optional[int] = None) -> ET.Element:
@@ -568,45 +659,46 @@ def _inject_notes_into_xml(notes_text: str, xml_path: str, spec: Dict[str, Any],
     tree.write(xml_path, xml_declaration=True, encoding='utf-8')
 
 
-def batch_update_notes(
-    pptx_path: str,
+def inject_notes(
+    deck_path: str,
     entries: Sequence[Tuple[int, str]],
     spec: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Update notes on multiple slides in a single unzip-modify-repack pass."""
+    """Inject notes into the deck at deck_path, in place, in one unzip-modify-repack pass.
+
+    Operates on whatever path it is handed — callers should pass a staged copy.
+    """
     if not entries:
-        return {"updated": 0, "slides": []}
+        return {"updated": 0, "slides": [], "verification": []}
 
-    tmp_path = get_tmp_path(pptx_path)
-    if not os.path.exists(tmp_path):
-        ensure_local_copy(pptx_path)
+    for slide_num, notes_text in entries:
+        if not (notes_text or "").strip():
+            raise ValueError(
+                f"Refusing to write empty notes to slide {slide_num}: that would erase the "
+                "slide's existing notes. Pass the notes text, or omit the slide."
+            )
 
-    unzip_dir = get_unzip_dir(pptx_path)
-    spec = spec or load_format_spec(pptx_path)[0]
-
-    prs = Presentation(tmp_path)
-    num_slides = len(prs.slides)
-    needs_save = False
-
-    for slide_num, _ in entries:
-        if slide_num < 1 or slide_num > num_slides:
-            raise ValueError(f"Slide {slide_num} is out of range (1..{num_slides})")
-        slide = prs.slides[slide_num - 1]
-        if not slide.has_notes_slide:
-            _ = slide.notes_slide
-            needs_save = True
-
-    if needs_save:
-        prs.save(tmp_path)
-
-    if os.path.exists(unzip_dir):
-        shutil.rmtree(unzip_dir)
-    os.makedirs(unzip_dir)
-
-    tmp_zipped = tmp_path + ".zip"
+    spec = spec or load_format_spec(deck_path)[0]
+    unzip_dir = tempfile.mkdtemp(prefix="lnprep-unzip-")
+    tmp_zipped = deck_path + ".zip"
     written_slides: List[Dict[str, Any]] = []
     try:
-        with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
+        prs = Presentation(deck_path)
+        num_slides = len(prs.slides)
+        needs_save = False
+
+        for slide_num, _ in entries:
+            if slide_num < 1 or slide_num > num_slides:
+                raise ValueError(f"Slide {slide_num} is out of range (1..{num_slides})")
+            slide = prs.slides[slide_num - 1]
+            if not slide.has_notes_slide:
+                _ = slide.notes_slide
+                needs_save = True
+
+        if needs_save:
+            prs.save(deck_path)
+
+        with zipfile.ZipFile(deck_path, 'r') as zip_ref:
             zip_ref.extractall(unzip_dir)
 
         for slide_num, notes_text in entries:
@@ -619,25 +711,31 @@ def batch_update_notes(
         if os.path.exists(tmp_zipped):
             os.remove(tmp_zipped)
         zip_dir(unzip_dir, tmp_zipped)
-        shutil.copy2(tmp_zipped, tmp_path)
+        shutil.copy2(tmp_zipped, deck_path)
     finally:
         if os.path.exists(tmp_zipped):
             try:
                 os.remove(tmp_zipped)
             except OSError:
                 pass
-        if os.path.exists(unzip_dir):
-            shutil.rmtree(unzip_dir, ignore_errors=True)
+        shutil.rmtree(unzip_dir, ignore_errors=True)
 
-    prs = Presentation(tmp_path)
+    prs = Presentation(deck_path)
     verification_checks: List[Dict[str, Any]] = []
     for slide_num, raw_notes in entries:
-        s = prs.slides[slide_num - 1]
-        written = get_slide_notes_text(s)
-        checks = ["⏱", "--- LECTURE NOTES ---", "--- SPEAKER NOTES ---"]
-        if "--- VISUAL DECONSTRUCTION ---" in raw_notes:
-            checks.append("--- VISUAL DECONSTRUCTION ---")
-        item_checks = {c: (c in written) for c in checks}
+        written = get_slide_notes_text(prs.slides[slide_num - 1])
+        # Only assert markers the caller actually supplied. Demanding a ⏱ badge the
+        # engine never writes reported false failures on otherwise valid payloads.
+        item_checks = {
+            marker: (marker in written)
+            for marker in (
+                "⏱",
+                "--- SPEAKER NOTES ---",
+                "--- LECTURE NOTES ---",
+                "--- VISUAL DECONSTRUCTION ---",
+            )
+            if marker in raw_notes
+        }
         verification_checks.append({"slide": slide_num, "checks": item_checks})
 
     return {
@@ -647,18 +745,38 @@ def batch_update_notes(
     }
 
 
+def apply_notes(
+    pptx_path: str,
+    entries: Sequence[Tuple[int, str]],
+    spec: Optional[Dict[str, Any]] = None,
+    backup: bool = True,
+) -> Dict[str, Any]:
+    """Safe write: verified backup, staged injection, atomic publish.
+
+    The original deck is replaced only after the staged copy has been injected
+    and read back, and only if the original is still byte-identical to what was
+    staged — so an edit made in PowerPoint during the write is never discarded.
+    """
+    backup_file = backup_once(pptx_path) if backup else None
+    staging = begin_staging(pptx_path)
+    try:
+        res = inject_notes(staging.deck, entries, spec=spec)
+        publish_staged(staging)
+    finally:
+        discard_staging(staging)
+    res["success"] = True
+    res["backup"] = backup_file
+    return res
+
+
 def update_slide(
     pptx_path: str,
     slide_num: int,
     notes_text: str,
     spec: Optional[Dict[str, Any]] = None,
-    sync: bool = True,
 ) -> Dict[str, Any]:
     """Update single slide notes using Direct XML Notes Injection."""
-    res = batch_update_notes(pptx_path, [(slide_num, notes_text)], spec=spec)
-    if sync:
-        sync_back(pptx_path)
-    return res
+    return apply_notes(pptx_path, [(slide_num, notes_text)], spec=spec)
 
 
 def load_notes_payload(path_or_str: str) -> Dict[str, Any]:

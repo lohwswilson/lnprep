@@ -47,12 +47,14 @@ def check_command(
     # 1. Audit
     audit_res = run_audit(str(pptx_path), slide_num=slide)
     audit_summary = audit_res.get("summary", {})
-    audit_failures = (
-        audit_summary.get("misaligned", 0)
-        + audit_summary.get("weak_quality", 0)
-        + audit_summary.get("unparsed_sbc", 0)
-        + audit_summary.get("no_sbc", 0)
-    )
+    # Deny-list, not allow-list. Counting only four named statuses silently dropped
+    # GAPS, NO_NOTES and anything added later, so a deck that was entirely gaps passed.
+    failing = {
+        status: count
+        for status, count in audit_summary.items()
+        if count and status.upper() not in ("PASS", "SKIPPED")
+    }
+    audit_failures = sum(failing.values())
 
     # 2. Extract notes and run reference check
     prs = Presentation(str(pptx_path))
@@ -98,11 +100,12 @@ def check_command(
     gate_table.add_column("Status", justify="center")
     gate_table.add_column("Details")
 
-    audit_status = "[green]PASS[/green]" if audit_failures == 0 else f"[red]FAIL ({audit_failures} issues)[/red]"
+    audit_status = "[green]PASS[/green]" if audit_failures == 0 else f"[red]FAIL ({audit_failures} slides)[/red]"
+    failing_detail = ", ".join(f"{k}: {v}" for k, v in sorted(failing.items())) or "no findings"
     gate_table.add_row(
         "SBC 5-Pass Audit",
         audit_status,
-        f"Pass: {audit_summary.get('pass', 0)}, Gaps: {audit_summary.get('gaps', 0)}, Quality failures: {audit_failures}",
+        f"Pass: {audit_summary.get('pass', 0)} · flagged: {audit_failures} ({failing_detail})",
     )
 
     ref_status = "[green]PASS[/green]" if blocking_refs == 0 else f"[red]FAIL ({blocking_refs} blocking)[/red]"

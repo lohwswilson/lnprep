@@ -1,5 +1,9 @@
 """Tests for SBC and Zone A depth standards."""
 
+import os
+
+from pptx import Presentation
+from pptx.util import Inches
 
 from lnprep.core import audit_engine as sa
 
@@ -141,3 +145,65 @@ def test_prose_rules():
     )
     d_ce = sa.audit_sbc_depth(ce, CFG)
     assert d_ce["items"][0]["paragraphs"] == 1
+
+
+def _deck_with_notes(directory: str, notes: str) -> str:
+    path = os.path.join(directory, "deck.pptx")
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "Risk: Bullwhip Effect"
+    box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(6), Inches(2))
+    box.text_frame.text = "Bullwhip Effect amplification across tiers"
+    slide.notes_slide.notes_text_frame.text = notes
+    prs.save(path)
+    return path
+
+
+def test_verdict_fails_a_slide_whose_sbc_fields_are_stubs(tmp_path):
+    """Depth and example sourcing must be able to fail the verdict.
+
+    Regression: audit_slide computed depth, Zone A depth and example sourcing and
+    then ignored all three, so a slide whose six SBC fields each held a single
+    word was reported as PASS.
+    """
+    notes = (
+        "--- SPEAKER NOTES ---\nTiming: 5 min\n\n"
+        "KEY POINT: A short but valid key point sentence here.\n\n"
+        "--- VISUAL DECONSTRUCTION ---\n\n"
+        "--- LECTURE NOTES ---\n"
+        "• SLIDE BODY COVERAGE — RISK:\n"
+        "Bullwhip Effect amplification across tiers:\n"
+        "Plain English: is\nDeep Research: research\nConcrete Example: example\n"
+        "Bigger Picture: x\nAssessment Link: y\nManager's So What: z"
+    )
+    result = sa.run_audit(_deck_with_notes(str(tmp_path), notes))["results"][0]
+
+    assert result["depth"]["status"] == "BELOW_DEPTH"
+    assert result["example_sources"]["status"] == "EXAMPLE_UNSOURCED"
+    assert result["status"] == "SHALLOW_DEPTH"
+
+
+def test_run_audit_reports_a_status_summary(tmp_path):
+    """run_audit must return a 'summary' its callers can render.
+
+    Regression: the key did not exist, so `lnprep audit` printed a table of zeros
+    for every status and `lnprep check`'s audit half was unconditionally zero --
+    the composite gate passed decks with no notes at all.
+    """
+    deck = _deck_with_notes(str(tmp_path), "--- LECTURE NOTES ---\nCore Narrative: x\n")
+    res = sa.run_audit(deck)
+
+    assert "summary" in res
+    assert sum(res["summary"].values()) == len(res["results"]) == 1
+    assert res["summary"]["no_sbc"] == 1
+    assert res["summary"]["pass"] == 0
+
+
+def test_summary_counts_every_documented_status():
+    """The summary must carry a bucket for every status audit_slide can emit."""
+    summary = sa.summarise_results(
+        [{"status": s} for s in sa.AUDIT_STATUSES] + [{"status": "PASS"}]
+    )
+    assert set(summary) == {s.lower() for s in sa.AUDIT_STATUSES}
+    assert summary["pass"] == 2
+    assert sum(summary.values()) == len(sa.AUDIT_STATUSES) + 1
