@@ -13,6 +13,7 @@ import os
 import re
 import socket
 import sys
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -283,6 +284,23 @@ _ALLOWED_SCHEMES = ("http", "https")
 _BLOCKED_HOST_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa", ".localdomain")
 _MAX_REDIRECTS = 5
 
+# Transient upstream states worth one more try. Anything else is a verdict.
+_RETRY_STATUSES = (429, 500, 502, 503, 504)
+_MAX_ATTEMPTS = 3
+_BASE_RETRY_WAIT = 1.0
+_MAX_RETRY_WAIT = 10.0
+
+
+def _retry_delay(headers: Any, attempt: int) -> float:
+    """Honour Retry-After when the server sends a sane one, else exponential backoff."""
+    raw = headers.get("Retry-After") if headers else None
+    if raw:
+        try:
+            return max(0.0, min(float(str(raw).strip()), _MAX_RETRY_WAIT))
+        except (TypeError, ValueError):
+            pass  # an HTTP-date Retry-After is legal but not worth parsing here
+    return min(_BASE_RETRY_WAIT * (2 ** attempt), _MAX_RETRY_WAIT)
+
 
 def _is_public_host(host: str) -> bool:
     """False for loopback, private, link-local, CGNAT or internal hostnames.
@@ -346,22 +364,29 @@ def _fetch(
             current,
             headers={"User-Agent": ua, "Accept": accept or "text/html,*/*;q=0.8"},
         )
-        try:
-            with opener.open(req, timeout=timeout) as r:
-                ctype = r.headers.get("Content-Type", "")
-                raw = r.read(MAX_DOWNLOAD_BYTES)
-                return r.status, r.geturl(), ctype, raw
-        except urllib.error.HTTPError as e:
-            headers = e.headers
-            location = headers.get("Location") if headers else None
-            if e.code in (301, 302, 303, 307, 308) and location:
-                nxt = urllib.parse.urljoin(current, location)
-                hop_ok, hop_why = _url_is_fetchable(nxt)
-                if not hop_ok:
-                    raise BlockedFetchError(f"redirect to a blocked address: {hop_why}") from e
-                current = nxt
-                continue
-            return e.code, current, (headers.get("Content-Type", "") if headers else ""), b""
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                with opener.open(req, timeout=timeout) as r:
+                    ctype = r.headers.get("Content-Type", "")
+                    raw = r.read(MAX_DOWNLOAD_BYTES)
+                    return r.status, r.geturl(), ctype, raw
+            except urllib.error.HTTPError as e:
+                if e.code in _RETRY_STATUSES and attempt < _MAX_ATTEMPTS - 1:
+                    # Crossref rate-limits readily and OpenLibrary answers 429 under
+                    # load. Without a retry these surfaced as UNREACHABLE, which since
+                    # the fail-closed gate change blocks write-back on a transient blip.
+                    time.sleep(_retry_delay(e.headers, attempt))
+                    continue
+                headers = e.headers
+                location = headers.get("Location") if headers else None
+                if e.code in (301, 302, 303, 307, 308) and location:
+                    nxt = urllib.parse.urljoin(current, location)
+                    hop_ok, hop_why = _url_is_fetchable(nxt)
+                    if not hop_ok:
+                        raise BlockedFetchError(f"redirect to a blocked address: {hop_why}") from e
+                    current = nxt
+                    break
+                return e.code, current, (headers.get("Content-Type", "") if headers else ""), b""
     raise BlockedFetchError(f"more than {_MAX_REDIRECTS} redirects")
 
 
@@ -496,9 +521,8 @@ def check_isbn(isbn: str, year: Optional[Any] = None, timeout: int = DEFAULT_HTT
     if st != 200:
         return {"status": "UNREACHABLE", "detail": f"OpenLibrary HTTP {st}"}
 
-    try:
-        meta = json.loads(raw.decode("utf-8", "replace"))
-    except json.JSONDecodeError:
+    meta = _parse_json_object(raw)
+    if meta is None:
         return {"status": "UNREACHABLE", "detail": "OpenLibrary returned non-JSON"}
 
     title = meta.get("title", "")
@@ -660,6 +684,7 @@ def _check_evidence(
     url_cache: Dict[Any, Any],
     doi_cache: Dict[Any, Any],
     numbers: Optional[List[str]] = None,
+    isbn_cache: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, Any]:
     if e["kind"] == "url" and any(p in e["value"] for p in _EPHEMERAL):
         return _ephemeral_result(e["value"], timeout, resolve=not offline)
@@ -671,7 +696,14 @@ def _check_evidence(
             doi_cache[ck] = check_doi(e["value"], author, year, timeout)
         return dict(doi_cache[ck])
     if e["kind"] == "isbn":
-        return check_isbn(e["value"], year, timeout)
+        # ISBN had no cache of any kind, so one book cited across 20 slides cost 20
+        # OpenLibrary requests — and OpenLibrary rate-limits, which now blocks.
+        if isbn_cache is None:
+            isbn_cache = {}
+        ck = (e["value"], str(year) if year else None)
+        if ck not in isbn_cache:
+            isbn_cache[ck] = check_isbn(e["value"], year, timeout)
+        return dict(isbn_cache[ck])
     ck = (e["value"], tuple(numbers or ()))
     if ck not in url_cache:
         url_cache[ck] = check_url(e["value"], numbers, timeout)
@@ -695,6 +727,7 @@ def verify_notes(
     examples: List[Dict[str, Any]] = []
     url_cache: Dict[Any, Any] = {}
     doi_cache: Dict[Any, Any] = {}
+    isbn_cache: Dict[Any, Any] = {}
     to_record: List[Dict[str, Any]] = []
 
     for slide, notes in sorted(notes_by_slide.items()):
@@ -745,7 +778,7 @@ def verify_notes(
                 if (e["kind"], e["value"]) in seen:
                     continue
                 seen.add((e["kind"], e["value"]))
-                res = _check_evidence(e, None, None, offline, timeout, url_cache, doi_cache)
+                res = _check_evidence(e, None, None, offline, timeout, url_cache, doi_cache, isbn_cache=isbn_cache)
                 findings.append({
                     "slide": slide,
                     "kind": e["kind"],
@@ -798,6 +831,7 @@ def verify_notes(
                 url_cache,
                 doi_cache,
                 nums,
+                isbn_cache=isbn_cache,
             )
             findings.append({
                 "slide": slide,
@@ -831,6 +865,7 @@ def verify_notes(
                     url_cache,
                     doi_cache,
                     nums,
+                    isbn_cache=isbn_cache,
                 )
                 findings.append({
                     "slide": slide,

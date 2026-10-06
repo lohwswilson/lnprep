@@ -122,13 +122,19 @@ def extract_image_info(
             with open(filepath, "wb") as f:
                 f.write(image.blob)
 
-        return {
+        info = {
             "type": "image",
             "file": filepath,
             "dimensions": f"{width}x{height}",
             "size_bytes": len(image.blob),
             "content_type": image.content_type,
         }
+        alt = shape_alt_text(shape)
+        if alt:
+            # Alt text is frequently the only machine-readable description of a
+            # diagram, and was never read at all.
+            info["alt_text"] = alt
+        return info
     except Exception as e:
         return {"type": "image", "error": str(e)}
 
@@ -203,26 +209,51 @@ def extract_slide_visuals(
     return visuals
 
 
+def shape_alt_text(shape: Any) -> str:
+    """The shape's alt text (descr), which is often the only description of a picture."""
+    element = getattr(shape, "_element", None)
+    if element is None:
+        return ""
+    try:
+        for node in element.iter():
+            if node.tag.endswith("}cNvPr"):
+                return (node.get("descr") or "").strip()
+    except (AttributeError, TypeError):
+        pass
+    return ""
+
+
 def extract_slide_context(slide: Any, slide_num: int) -> Dict[str, Any]:
     """Extract all context needed for prompt generation from a slide."""
     title = get_slide_title(slide)
     body_text = extract_slide_body_text(slide)
     existing_notes = get_slide_notes_text(slide)
 
-    visuals = []
-    for shape in slide.shapes:
-        if getattr(shape, "has_table", False):
-            t = extract_table_content(shape)
-            if t:
-                visuals.append({"type": "table", "rows": t["rows"], "columns": t["columns"], "data": t["data"]})
-        if shape.shape_type == MSO_SHAPE_TYPE.CHART:
-            c = extract_chart_info(shape)
-            if c:
-                visuals.append({"type": "chart", **c})
-        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-            visuals.append({"type": "image"})
-        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            visuals.append({"type": "group", "name": shape.name})
+    visuals: List[Dict[str, Any]] = []
+    # Walk into groups. This used to iterate slide.shapes only, so a table or chart
+    # nested in a group was invisible to prompt generation — even though the audit
+    # engine's own walker sees it — and a group contributed nothing but its name.
+    for shape in _walk_shapes(slide.shapes):
+        try:
+            if getattr(shape, "has_table", False):
+                t = extract_table_content(shape)
+                if t:
+                    visuals.append({
+                        "type": "table", "rows": t["rows"],
+                        "columns": t["columns"], "data": t["data"],
+                    })
+            elif shape.shape_type == MSO_SHAPE_TYPE.CHART:
+                c = extract_chart_info(shape)
+                if c:
+                    visuals.append({"type": "chart", **c})
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                entry: Dict[str, Any] = {"type": "image"}
+                alt = shape_alt_text(shape)
+                if alt:
+                    entry["alt_text"] = alt
+                visuals.append(entry)
+        except Exception:
+            continue
 
     return {
         "slide": slide_num,
@@ -359,13 +390,19 @@ def extract_slide_images(
                         size = f"{dim[0]}x{dim[1]}"
                     except Exception:
                         size = "?"
-                    visuals.append({
+                    entry = {
                         "type": "image",
                         "file": filename,
                         "path": filepath,
                         "size": size,
                         "bytes": len(image.blob),
-                    })
+                    }
+                    alt = shape_alt_text(shape)
+                    if alt:
+                        # Carried into the review brief too: alt text is often the
+                        # only machine-readable description of a diagram.
+                        entry["alt_text"] = alt
+                    visuals.append(entry)
                 except Exception as exc:
                     visuals.append({
                         "type": "image",

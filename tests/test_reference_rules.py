@@ -1,11 +1,15 @@
 """Tests for reference verification rules and gates."""
 
 import http.server
+import io
 import os
 import shutil
 import socketserver
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -167,6 +171,85 @@ def test_gate_blocks_when_the_network_is_unreachable(monkeypatch):
     finally:
         devnull.close()
         shutil.rmtree(deck_dir, ignore_errors=True)
+
+
+def test_isbn_is_cached_across_slides(monkeypatch):
+    """ISBN had no cache of any kind, so one book cited across 20 slides cost 20
+    OpenLibrary requests — and OpenLibrary rate-limits, which now blocks write-back."""
+    calls = []
+
+    def fake_isbn(isbn, year=None, timeout=0):
+        calls.append(isbn)
+        return {"status": "VERIFIED", "detail": "stub", "evidence": {"title": "Book"}}
+
+    monkeypatch.setattr(vr, "check_isbn", fake_isbn)
+
+    notes = {
+        i: f"Deep Research: Biggs & Tang (2011) ISBN 978-0-273-01913-8 supports item {i}."
+        for i in range(1, 21)
+    }
+    rep = vr.verify_notes(notes, cache_root=None)
+
+    assert len(calls) == 1, f"expected one ISBN lookup, got {len(calls)}"
+    assert rep["counts"].get("VERIFIED", 0) == 20
+
+
+def _fake_open(fail_times, code=429, retry_after=None, body=b'{"message":{"title":["T"],"author":[{"family":"Chor"}],"issued":{"date-parts":[[2023]]}}}'):
+    state = {"n": 0}
+
+    class _Resp(io.BytesIO):
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def geturl(self):
+            return "https://api.crossref.org/works/10.1234/abc"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _open(self, req, timeout=None):
+        if state["n"] < fail_times:
+            state["n"] += 1
+            headers = {"Retry-After": retry_after} if retry_after else {}
+            raise urllib.error.HTTPError(req.full_url, code, "err", headers, None)
+        return _Resp(body)
+
+    return _open
+
+
+def test_fetch_retries_transient_upstream_errors(monkeypatch):
+    """A transient 429 used to surface as UNREACHABLE — which, since the gate became
+    fail-closed, blocked write-back on a momentary blip."""
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(round(s, 2)))
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _fake_open(fail_times=2))
+
+    assert vr.check_doi("10.1234/abc", author="Chor", year="2023")["status"] == "VERIFIED"
+    assert sleeps == [1.0, 2.0], "exponential backoff between attempts"
+
+
+def test_fetch_honours_retry_after(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(round(s, 2)))
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", _fake_open(fail_times=2, retry_after="3")
+    )
+    vr.check_doi("10.1234/abc", author="Chor", year="2023")
+    assert sleeps == [3.0, 3.0]
+
+
+def test_fetch_gives_up_after_the_attempt_cap(monkeypatch):
+    """A persistently failing upstream must still terminate, and still block."""
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _fake_open(fail_times=99))
+
+    assert vr.check_doi("10.1234/abc", author="Chor", year="2023")["status"] == "UNREACHABLE"
+    assert "UNREACHABLE" in vr.BLOCKING, "an unchecked reference must block write-back"
+    assert len(sleeps) == 2, "two backoffs for three attempts"
 
 
 def test_check_doi_survives_non_json_and_malformed_payloads(monkeypatch):

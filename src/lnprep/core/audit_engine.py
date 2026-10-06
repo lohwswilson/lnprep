@@ -136,12 +136,49 @@ def split_speaker_and_lecture(text: str, speaker_first: bool = True) -> Tuple[st
     return speaker_part, lecture_part
 
 
+# A heading line, as opposed to a prose mention: at most a few non-word characters
+# (a bullet glyph, an emoji, spaces) before the phrase.
+_SBC_HEADING_RE = re.compile(r"^[^\w\n]{0,4}\s*slide body coverage\b.*$", re.IGNORECASE | re.MULTILINE)
+
+# Sections that may follow the coverage block. The block used to run to the end of the
+# lecture text, so a trailing "Recommended Videos:" heading was parsed as an extra SBC
+# item with no fields: it scored 0 and dragged a complete slide's average to WEAK.
+# These match only a bare heading, so an evidence line such as
+# `Sources: Org (2025) "Title", https://…` is untouched.
+_TRAILING_SECTION_RE = re.compile(
+    r"^\s*(?:[^\w\s]\s*)?"
+    r"(?:recommended videos|academic and industry references|further reading|"
+    r"references|sources|key citations|useful links)"
+    r"\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
 def extract_sbc_block(lecture_text: str) -> str:
-    """Extract Slide Body Coverage block from lecture notes."""
-    lower = lecture_text.lower()
-    if "slide body coverage" not in lower:
+    """Extract the Slide Body Coverage block from lecture notes.
+
+    Bounded at the first trailing section heading, and anchored to the first heading
+    line rather than the first occurrence of the phrase — a prose mention ("see the
+    slide body coverage for details") used to start the block in the wrong place and
+    drag unrelated text into the quality average.
+    """
+    heading = _SBC_HEADING_RE.search(lecture_text)
+    if heading:
+        # Cut at the phrase itself rather than at the bullet glyph before it —
+        # parse_sbc_items skips a line that *starts* with "SLIDE BODY COVERAGE".
+        start = heading.start() + heading.group(0).casefold().find("slide body coverage")
+    else:
+        start = lecture_text.casefold().find("slide body coverage")
+    if start < 0:
         return ""
-    return lecture_text[lower.find("slide body coverage"):]
+
+    lines = lecture_text[start:].split("\n")
+    block = [lines[0]]
+    for line in lines[1:]:
+        if _TRAILING_SECTION_RE.match(line):
+            break
+        block.append(line)
+    return "\n".join(block)
 
 
 def get_body_items(slide: Any) -> Tuple[List[str], List[str]]:
@@ -298,11 +335,24 @@ def audit_alignment(
     }
 
 
-def _is_field_label(line: str, field_labels: List[str]) -> bool:
+# Bullet glyphs that mark a top-level item. Only "* " used to be recognised, so a
+# Word/AI "• " item was absorbed into the previous one. "-" is deliberately absent:
+# in this format it introduces a sub-line *within* a field (e.g. "- Classical
+# Foundation:" under "Deep Research:"), not a new item.
+_BULLET_CHARS = "*•‣∙"
+
+
+def _strip_bullet(line: str) -> Tuple[str, bool]:
+    """Return (text_without_bullet, was_bulleted)."""
     s = line.strip()
-    if s.startswith("* "):
-        s = s[2:].strip()
-    low = s.lower()
+    if len(s) >= 2 and s[0] in _BULLET_CHARS and s[1] in " \t":
+        return s[1:].strip(), True
+    return s, False
+
+
+def _is_field_label(line: str, field_labels: List[str]) -> bool:
+    body, _ = _strip_bullet(line)
+    low = body.lower()
     return any(low.startswith(lbl.lower() + ":") for lbl in field_labels)
 
 
@@ -319,7 +369,8 @@ def parse_sbc_items(sbc_block: str, field_labels: List[str]) -> Tuple[List[Dict[
         stripped = raw.strip()
         if not stripped:
             continue
-        if stripped.upper().startswith("SLIDE BODY COVERAGE"):
+        body, bulleted = _strip_bullet(stripped)
+        if body.upper().startswith("SLIDE BODY COVERAGE"):
             continue
         if _is_field_label(stripped, field_labels):
             if current is None:
@@ -327,14 +378,17 @@ def parse_sbc_items(sbc_block: str, field_labels: List[str]) -> Tuple[List[Dict[
             current["text"] += " " + stripped
             continue
 
-        bulleted = stripped.startswith("* ")
-        body = stripped[2:].strip() if bulleted else stripped
+        # A bare header is a short label line ending in ":". The old rule also
+        # required exactly one colon, which rejected ordinary case-deck bullets such
+        # as "Stage 2: Distribution design:" — every item then vanished and the slide
+        # was reported as a hard UNPARSED_SBC failure.
         is_bare_header = (
             not bulleted
             and body.endswith(":")
             and len(body) <= 90
             and "  " not in body
-            and body.count(":") == 1
+            and not any(ch in body for ch in ".?!")
+            and len(body.split()) <= 14
         )
         if bulleted or is_bare_header:
             if current is not None:

@@ -147,6 +147,81 @@ def test_prose_rules():
     assert d_ce["items"][0]["paragraphs"] == 1
 
 
+_SBC_FIELDS = [
+    "Plain English", "Deep Research", "Concrete Example",
+    "Bigger Picture", "Assessment Link", "Manager's So What",
+]
+_SBC_CFG = {"field_labels": _SBC_FIELDS, "min_paragraphs": 2}
+_COMPLETE_ITEM = """Plain English: A stakeholder is anyone affected by the operation here.
+Deep Research: Freeman (1984) is the seminal study of this mechanism.
+Concrete Example: For example, PSA Tuas Port serves its stakeholders.
+Bigger Picture: Strategically, the consequence for the network matters.
+Assessment Link: This applies in the assignment report you will write.
+Manager's So What: Actionable takeaway: managers should act on this."""
+
+
+def test_trailing_section_does_not_become_a_score_zero_item():
+    """The coverage block must stop before a trailing section.
+
+    It used to run to the end of the lecture text, so a following "Recommended
+    Videos:" heading was parsed as an item with no fields. That scored 0 and dragged
+    a complete slide's average below the quality bar — a false WEAK_QUALITY.
+    """
+    block = "• SLIDE BODY COVERAGE — RISK:\nReal Item:\n" + _COMPLETE_ITEM + "\n"
+    assert sa.audit_sbc_quality(sa.extract_sbc_block(block), _SBC_CFG)["status"] == "PASS"
+
+    with_trailing = block + "\n• RECOMMENDED VIDEOS:\n- Clip 1\n- Clip 2\n"
+    quality = sa.audit_sbc_quality(sa.extract_sbc_block(with_trailing), _SBC_CFG)
+    assert len(quality["items"]) == 1
+    assert quality["status"] == "PASS"
+
+
+def test_sbc_block_starts_at_the_heading_not_a_prose_mention():
+    prose = (
+        "Core Narrative: see the slide body coverage for details of each item.\n"
+        "Unrelated narrative text follows here.\n\n"
+        "• SLIDE BODY COVERAGE — RISK:\nReal Item:\n" + _COMPLETE_ITEM + "\n"
+    )
+    block = sa.extract_sbc_block(prose)
+    assert block.lstrip().upper().startswith("SLIDE BODY COVERAGE")
+
+
+def test_item_header_with_internal_colon_is_still_an_item():
+    """A case-deck bullet such as "Stage 2: Distribution design:" has more than one
+    colon, and the old header rule rejected it — every item then disappeared and the
+    slide was reported as a hard UNPARSED_SBC failure."""
+    block = "• SLIDE BODY COVERAGE — PROCESS:\nStage 2: Distribution design:\n" + _COMPLETE_ITEM + "\n"
+    quality = sa.audit_sbc_quality(sa.extract_sbc_block(block), _SBC_CFG)
+    assert len(quality["items"]) == 1
+    assert quality["status"] == "PASS"
+
+
+def test_bullet_glyphs_other_than_asterisk_are_recognised():
+    """Only "* " counted as a bullet, so a Word/AI "• " item was absorbed."""
+    block = "• SLIDE BODY COVERAGE — RISK:\n• Real Item:\n" + _COMPLETE_ITEM + "\n"
+    items, named = sa.parse_sbc_items(sa.extract_sbc_block(block), _SBC_FIELDS)
+    assert named == 1
+    assert items[0]["label"] == "Real Item:"
+
+
+def test_dash_sub_lines_are_not_promoted_to_items():
+    """ "-" introduces a sub-line within a field, not a new item. Treating it as one
+    split "Deep Research" apart and halved the quality score."""
+    block = (
+        "• SLIDE BODY COVERAGE — RISK:\nReal Item:\n"
+        "Plain English: A stakeholder is anyone affected by the operation here.\n"
+        "Deep Research:\n- Classical Foundation: Freeman (1984) is the seminal study.\n"
+        "- Contemporary Frontier (2024-2026): Recent research describes it.\n"
+        "Concrete Example: For example, PSA Tuas Port serves its stakeholders.\n"
+        "Bigger Picture: Strategically, the consequence for the network matters.\n"
+        "Assessment Link: This applies in the assignment report you will write.\n"
+        "Manager's So What: Actionable takeaway: managers should act on this.\n"
+    )
+    items, named = sa.parse_sbc_items(sa.extract_sbc_block(block), _SBC_FIELDS)
+    assert named == 1
+    assert "Classical Foundation" in items[0]["text"]
+
+
 def test_zone_markers_are_case_insensitive_and_crlf_safe():
     """Lowercase markers used to put the whole text in the speaker half, so every
     slide reported NO_SBC with nothing said about why."""
