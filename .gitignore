@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Environment variables
+.env
+
+# Test & Coverage
+.coverage
+.pytest_cache/
+coverage.xml
+htmlcov/
+
+# Working copies & backups
+*.bak
+*_backup_*.pptx
+.citation_cache.json
+.reference_overrides.log
+
+# macOS
+.DS_Store
