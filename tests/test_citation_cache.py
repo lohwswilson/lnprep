@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from lnprep.core import citation_db as cc
@@ -114,22 +115,75 @@ def test_require_evidence_to_record(temp_module_root):
 
 def test_prune_and_hits(temp_module_root):
     cc.record_entry(temp_module_root, "OldAuthor", "2020", title="Old Paper")
+    cc.record_entry(temp_module_root, "OlderAuthor", "2019", title="Older Paper")
     cc.record_entry(temp_module_root, "FreshAuthor", "2025", title="Fresh Paper")
 
     data = cc.load(temp_module_root)
     old_key = cc.normalise_key("OldAuthor", "2020")
-    data["citations"][old_key]["verified_at"] = (
-        datetime.now(timezone.utc).astimezone() - timedelta(days=200)
-    ).isoformat()
+    for key in (old_key, cc.normalise_key("OlderAuthor", "2019")):
+        data["citations"][key]["verified_at"] = (
+            datetime.now(timezone.utc).astimezone() - timedelta(days=200)
+        ).isoformat()
     cc.save(temp_module_root, data)
 
     cc.log_hit(temp_module_root, "OldAuthor", "2020")
     data_after_hit = cc.load(temp_module_root)
     assert data_after_hit["citations"][old_key]["hits"] == 1
 
-    kept, dropped, keys = cc.prune(temp_module_root, ttl_days=180)
-    assert dropped == 1
+    # prune returns (dropped, kept, dropped_keys). Distinct counts, so a transposed
+    # unpack fails instead of passing on equal numbers.
+    dropped, kept, keys = cc.prune(temp_module_root, ttl_days=180)
+    assert dropped == 2
     assert kept == 1
+    assert sorted(keys) == sorted([old_key, cc.normalise_key("OlderAuthor", "2019")])
+
     d_pruned = cc.load(temp_module_root)
     assert old_key not in d_pruned["citations"]
     assert cc.normalise_key("FreshAuthor", "2025") in d_pruned["citations"]
+
+
+def test_find_module_root_accepts_the_module_folder_itself(temp_module_root):
+    """A folder argument must resolve to itself.
+
+    Regression: it was resolved from its *parent*, so `cache record <module>` wrote a
+    cache beside the course directory while verify/write read one inside the module,
+    and the two halves silently disagreed.
+    """
+    parent = os.path.dirname(temp_module_root)
+    assert cc.find_module_root(temp_module_root) == temp_module_root
+    assert cc.find_module_root(temp_module_root) != parent
+    assert cc.find_module_root(os.path.join(temp_module_root, "deck.pptx")) == temp_module_root
+
+
+def test_prune_refuses_an_unreadable_cache_without_bricking_it(temp_module_root):
+    """Regression: prune persisted the _load_failed sentinel to disk, after which
+    every lookup returned MISS and every record was refused — permanently."""
+    cache_file = cc.cache_path(temp_module_root)
+    with open(cache_file, "w") as f:
+        f.write("{not valid json")
+
+    with pytest.raises(cc.CacheUnreadableError):
+        cc.prune(temp_module_root)
+
+    # The unreadable file is left exactly as it was, for the user to inspect.
+    assert open(cache_file).read() == "{not valid json"
+    assert cc.load(temp_module_root).get("_load_failed") is True
+
+
+def test_report_days_left_is_numeric_for_stale_entries(temp_module_root):
+    """Regression: stale rows carried the string "STALE" as days_left, which the CLI
+    then passed to abs() -> TypeError, so `cache report` crashed on any stale cache."""
+    cc.record_entry(temp_module_root, "OldAuthor", "2020", title="Old Paper")
+    data = cc.load(temp_module_root)
+    key = cc.normalise_key("OldAuthor", "2020")
+    data["citations"][key]["verified_at"] = (
+        datetime.now(timezone.utc).astimezone() - timedelta(days=400)
+    ).isoformat()
+    cc.save(temp_module_root, data)
+
+    rep = cc.get_report_data(temp_module_root)
+    row = rep["entries"][0]
+    assert row["status"] == "HIT_STALE"
+    assert isinstance(row["days_left"], float) and row["days_left"] < 0
+    assert rep["stale"] == 1
+    assert rep["cache_path"].endswith(".citation_cache.json")

@@ -17,8 +17,6 @@ from lnprep.core import citation_db as cc
 from lnprep.core import ref_verifier as vr
 from lnprep.core.common import get_slide_notes_text
 
-app = typer.Typer(help="Verify citations, evidence links, and Concrete Example sources")
-
 
 def _parse_range(spec: Optional[str], total: int) -> Set[int]:
     if not spec or spec.strip().lower() == "all":
@@ -42,7 +40,6 @@ def _parse_range(spec: Optional[str], total: int) -> Set[int]:
     return {n for n in out if 1 <= n <= total}
 
 
-@app.callback(invoke_without_command=True)
 def verify_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(

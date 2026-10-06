@@ -42,11 +42,15 @@ def cache_lookup(
             raise typer.Exit(code=1)
         return
 
-    if status == "HIT_FRESH":
+    if status == "HIT_FRESH" and days_left is not None:
         print_success(f"HIT (FRESH) — {days_left:.1f} days remaining")
         console.print(entry)
     elif status == "HIT_STALE":
-        print_warning(f"HIT (STALE) — expired {abs(days_left):.1f} days ago")
+        expired = f"expired {abs(days_left):.1f} days ago" if days_left is not None else "age unknown"
+        print_warning(f"HIT (STALE) — {expired}")
+        console.print(entry)
+    elif status == "HIT_FRESH":
+        print_warning("HIT — freshness could not be determined (no usable verified_at)")
         console.print(entry)
     else:
         print_info(f"MISS — not cached for module: {root}")
@@ -105,8 +109,13 @@ def cache_report(
         print_formatted(rep, as_json=True)
         return
 
-    console.print(f"[bold cyan]Citation Cache Report:[/bold cyan] {rep.get('cache_file')}")
-    console.print(f"Total: {rep.get('total')} | Fresh: [green]{rep.get('fresh')}[/green] | Stale: [yellow]{rep.get('stale')}[/yellow]\n")
+    console.print(f"[bold cyan]Citation Cache Report:[/bold cyan] {rep.get('cache_path')}")
+    if rep.get("unreadable"):
+        print_warning(f"Cache is unreadable — nothing is being served from it. {rep.get('load_error', '')}")
+    console.print(
+        f"Total: {rep.get('total')} | Fresh: [green]{rep.get('fresh')}[/green] | "
+        f"Stale: [yellow]{rep.get('stale')}[/yellow]\n"
+    )
 
     entries = rep.get("entries", [])
     if entries:
@@ -119,12 +128,19 @@ def cache_report(
 
         for e in entries:
             st = e.get("status")
-            color = "green" if st == "FRESH" else "yellow"
-            left = f"{e.get('days_left', 0):.0f}" if st == "FRESH" else f"-{abs(e.get('days_left', 0)):.0f}"
+            fresh = st == "HIT_FRESH"
+            color = "green" if fresh else "yellow"
+            days = e.get("days_left")
+            if days is None:
+                left = "—"
+            elif fresh:
+                left = f"{days:.0f}"
+            else:
+                left = f"-{abs(days):.0f}"
             ev = e.get("doi") or e.get("url") or e.get("title") or "—"
             table.add_row(
                 f"{e.get('author')} ({e.get('year')})",
-                f"[{color}]{st}[/{color}]",
+                f"[{color}]{'FRESH' if fresh else 'STALE'}[/{color}]",
                 left,
                 str(e.get("hits", 0)),
                 str(ev)[:45],
@@ -145,14 +161,29 @@ def cache_prune(
     root = cc.find_module_root(str(module_path))
     if dry_run:
         rep = cc.get_report_data(root, ttl_days=ttl_days)
-        stale_entries = [e for e in rep.get("entries", []) if e.get("status") == "STALE"]
+        # The report emits HIT_STALE; filtering on "STALE" matched nothing, so this
+        # always claimed there was nothing to prune.
+        stale_entries = [e for e in rep.get("entries", []) if e.get("status") == "HIT_STALE"]
         if as_json:
-            print_formatted({"dry_run": True, "stale_count": len(stale_entries), "stale": stale_entries}, as_json=True)
+            print_formatted(
+                {"dry_run": True, "stale_count": len(stale_entries), "stale": stale_entries},
+                as_json=True,
+            )
         else:
+            if rep.get("unreadable"):
+                print_warning(f"Cache is unreadable. {rep.get('load_error', '')}")
             print_info(f"Dry run: {len(stale_entries)} stale citation(s) would be pruned.")
         return
 
-    kept, dropped, keys = cc.prune(root, ttl_days=ttl_days)
+    try:
+        dropped, kept, keys = cc.prune(root, ttl_days=ttl_days)
+    except cc.CacheUnreadableError as exc:
+        if as_json:
+            print_formatted({"success": False, "error": str(exc)}, as_json=True)
+        else:
+            print_error(str(exc))
+        raise typer.Exit(code=2)
+
     if as_json:
         print_formatted({"kept": kept, "dropped": dropped, "pruned_keys": keys}, as_json=True)
         return

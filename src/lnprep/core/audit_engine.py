@@ -12,18 +12,24 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from lnprep.config import DEFAULT_ALIGNMENT_THRESHOLD, DEFAULT_MIN_OVERLAP
 from lnprep.core.common import (
     DEFAULT_FORMAT_SPEC,
+    PARAGRAPH_RULES,
+    ZONE_LECTURE,
+    ZONE_SPEAKER,
+    ZONE_VISUAL,
     get_slide_notes_text,
     get_slide_title,
     has_visual_content,
     load_format_spec,
-    PARAGRAPH_RULES,
+    normalise_newlines,
+    zone_index,
 )
 from lnprep.core.ref_verifier import check_example_sourcing
 
@@ -103,32 +109,76 @@ def is_chrome(text: str) -> bool:
 
 
 def split_speaker_and_lecture(text: str, speaker_first: bool = True) -> Tuple[str, str]:
-    """Split notes text into (speaker_text, lecture_text)."""
-    sp = "--- SPEAKER NOTES ---"
-    le = "--- LECTURE NOTES ---"
-    vd = "--- VISUAL DECONSTRUCTION ---"
+    """Split notes text into (speaker_text, lecture_text).
 
-    if le in text and sp in text and not speaker_first:
-        i = text.find(sp)
-        speaker_part, lecture_part = text[i + len(sp):], text[:i]
-    elif le in text:
-        parts = text.split(le, 1)
-        speaker_part, lecture_part = parts[0], parts[1]
+    Markers are matched case-insensitively, on the first occurrence only, and the
+    text is newline-normalised first. A case-sensitive `in`/`split` meant a deck
+    using lowercase markers put the whole text in the speaker half and produced
+    NO_SBC for every slide, with nothing said about why.
+    """
+    text = normalise_newlines(text)
+    sp_at = zone_index(text, ZONE_SPEAKER)
+    le_at = zone_index(text, ZONE_LECTURE)
+
+    if le_at >= 0 and sp_at >= 0 and not speaker_first:
+        speaker_part = text[sp_at + len(ZONE_SPEAKER):]
+        lecture_part = text[:sp_at]
+    elif le_at >= 0:
+        speaker_part = text[:le_at]
+        lecture_part = text[le_at + len(ZONE_LECTURE):]
     else:
         speaker_part, lecture_part = text, ""
 
-    if vd in speaker_part:
-        speaker_part = speaker_part.split(vd, 1)[0]
+    vd_at = zone_index(speaker_part, ZONE_VISUAL)
+    if vd_at >= 0:
+        speaker_part = speaker_part[:vd_at]
 
     return speaker_part, lecture_part
 
 
+# A heading line, as opposed to a prose mention: at most a few non-word characters
+# (a bullet glyph, an emoji, spaces) before the phrase.
+_SBC_HEADING_RE = re.compile(r"^[^\w\n]{0,4}\s*slide body coverage\b.*$", re.IGNORECASE | re.MULTILINE)
+
+# Sections that may follow the coverage block. The block used to run to the end of the
+# lecture text, so a trailing "Recommended Videos:" heading was parsed as an extra SBC
+# item with no fields: it scored 0 and dragged a complete slide's average to WEAK.
+# These match only a bare heading, so an evidence line such as
+# `Sources: Org (2025) "Title", https://…` is untouched.
+_TRAILING_SECTION_RE = re.compile(
+    r"^\s*(?:[^\w\s]\s*)?"
+    r"(?:recommended videos|academic and industry references|further reading|"
+    r"references|sources|key citations|useful links)"
+    r"\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
 def extract_sbc_block(lecture_text: str) -> str:
-    """Extract Slide Body Coverage block from lecture notes."""
-    lower = lecture_text.lower()
-    if "slide body coverage" not in lower:
+    """Extract the Slide Body Coverage block from lecture notes.
+
+    Bounded at the first trailing section heading, and anchored to the first heading
+    line rather than the first occurrence of the phrase — a prose mention ("see the
+    slide body coverage for details") used to start the block in the wrong place and
+    drag unrelated text into the quality average.
+    """
+    heading = _SBC_HEADING_RE.search(lecture_text)
+    if heading:
+        # Cut at the phrase itself rather than at the bullet glyph before it —
+        # parse_sbc_items skips a line that *starts* with "SLIDE BODY COVERAGE".
+        start = heading.start() + heading.group(0).casefold().find("slide body coverage")
+    else:
+        start = lecture_text.casefold().find("slide body coverage")
+    if start < 0:
         return ""
-    return lecture_text[lower.find("slide body coverage"):]
+
+    lines = lecture_text[start:].split("\n")
+    block = [lines[0]]
+    for line in lines[1:]:
+        if _TRAILING_SECTION_RE.match(line):
+            break
+        block.append(line)
+    return "\n".join(block)
 
 
 def get_body_items(slide: Any) -> Tuple[List[str], List[str]]:
@@ -230,8 +280,8 @@ def audit_coverage(body_items: List[str], lecture_text: str, cfg: Optional[Dict[
 def audit_alignment(
     body_items: List[str],
     sbc_block: str,
-    threshold: float = 0.10,
-    min_overlap: int = 2,
+    threshold: float = DEFAULT_ALIGNMENT_THRESHOLD,
+    min_overlap: int = DEFAULT_MIN_OVERLAP,
     min_body_terms: int = 6,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -285,11 +335,24 @@ def audit_alignment(
     }
 
 
-def _is_field_label(line: str, field_labels: List[str]) -> bool:
+# Bullet glyphs that mark a top-level item. Only "* " used to be recognised, so a
+# Word/AI "• " item was absorbed into the previous one. "-" is deliberately absent:
+# in this format it introduces a sub-line *within* a field (e.g. "- Classical
+# Foundation:" under "Deep Research:"), not a new item.
+_BULLET_CHARS = "*•‣∙"
+
+
+def _strip_bullet(line: str) -> Tuple[str, bool]:
+    """Return (text_without_bullet, was_bulleted)."""
     s = line.strip()
-    if s.startswith("* "):
-        s = s[2:].strip()
-    low = s.lower()
+    if len(s) >= 2 and s[0] in _BULLET_CHARS and s[1] in " \t":
+        return s[1:].strip(), True
+    return s, False
+
+
+def _is_field_label(line: str, field_labels: List[str]) -> bool:
+    body, _ = _strip_bullet(line)
+    low = body.lower()
     return any(low.startswith(lbl.lower() + ":") for lbl in field_labels)
 
 
@@ -306,7 +369,8 @@ def parse_sbc_items(sbc_block: str, field_labels: List[str]) -> Tuple[List[Dict[
         stripped = raw.strip()
         if not stripped:
             continue
-        if stripped.upper().startswith("SLIDE BODY COVERAGE"):
+        body, bulleted = _strip_bullet(stripped)
+        if body.upper().startswith("SLIDE BODY COVERAGE"):
             continue
         if _is_field_label(stripped, field_labels):
             if current is None:
@@ -314,14 +378,17 @@ def parse_sbc_items(sbc_block: str, field_labels: List[str]) -> Tuple[List[Dict[
             current["text"] += " " + stripped
             continue
 
-        bulleted = stripped.startswith("* ")
-        body = stripped[2:].strip() if bulleted else stripped
+        # A bare header is a short label line ending in ":". The old rule also
+        # required exactly one colon, which rejected ordinary case-deck bullets such
+        # as "Stage 2: Distribution design:" — every item then vanished and the slide
+        # was reported as a hard UNPARSED_SBC failure.
         is_bare_header = (
             not bulleted
             and body.endswith(":")
             and len(body) <= 90
             and "  " not in body
-            and body.count(":") == 1
+            and not any(ch in body for ch in ".?!")
+            and len(body.split()) <= 14
         )
         if bulleted or is_bare_header:
             if current is not None:
@@ -724,11 +791,41 @@ def audit_cadence(prs: Any, cfg: Optional[Dict[str, Any]] = None) -> Optional[Di
     }
 
 
+# Every status audit_slide can emit. Callers should treat anything outside
+# ("PASS", "SKIPPED") as a finding rather than allow-listing individual statuses —
+# an allow-list silently drops statuses added later.
+AUDIT_STATUSES = (
+    "PASS",
+    "GAPS",
+    "MISALIGNED",
+    "WEAK_QUALITY",
+    "SHALLOW_DEPTH",
+    "WEAK_ZONE_A",
+    "UNSOURCED_EXAMPLES",
+    "UNPARSED_SBC",
+    "NO_SBC",
+    "NO_NOTES",
+    "SKIPPED",
+)
+
+# Depth verdicts that mean "the writing is too thin", as opposed to "the field is absent".
+_DEPTH_FAILURES = ("BELOW_DEPTH", "NOT_PROSE", "OVER_MAX_PARAGRAPHS")
+
+
+def summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Count slides per status, keyed lowercase."""
+    counts = {status.lower(): 0 for status in AUDIT_STATUSES}
+    for result in results:
+        key = str(result.get("status", "")).lower()
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def audit_slide(
     slide: Any,
     slide_num: int,
-    threshold: float = 0.10,
-    min_overlap: int = 2,
+    threshold: float = DEFAULT_ALIGNMENT_THRESHOLD,
+    min_overlap: int = DEFAULT_MIN_OVERLAP,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run all SBC audit passes on a single slide."""
@@ -775,6 +872,9 @@ def audit_slide(
     example_sources = audit_example_sources(lecture_text, cfg)
     formatting = audit_formatting(slide, cfg)
 
+    # Every pass below is computed above; each one that can judge the notes must be
+    # able to fail them. Depth, Zone A depth and example sourcing used to be computed
+    # and then ignored, so a slide whose six SBC fields each held one word scored PASS.
     if not sbc_block:
         overall = "NO_SBC"
     elif quality["status"] == "NO_ITEMS_PARSED":
@@ -783,6 +883,12 @@ def audit_slide(
         overall = "MISALIGNED"
     elif quality["status"] in ("WEAK", "FAIL"):
         overall = "WEAK_QUALITY"
+    elif depth["status"] in _DEPTH_FAILURES:
+        overall = "SHALLOW_DEPTH"
+    elif zone_a_depth["status"] in _DEPTH_FAILURES:
+        overall = "WEAK_ZONE_A"
+    elif example_sources["status"] == "EXAMPLE_UNSOURCED":
+        overall = "UNSOURCED_EXAMPLES"
     elif coverage and coverage["missing"] > 0:
         overall = "GAPS"
     else:
@@ -807,8 +913,8 @@ def audit_slide(
 
 def run_audit(
     pptx_path: str,
-    threshold: float = 0.10,
-    min_overlap: int = 2,
+    threshold: float = DEFAULT_ALIGNMENT_THRESHOLD,
+    min_overlap: int = DEFAULT_MIN_OVERLAP,
     slide_num: Optional[int] = None,
     depth_summary: bool = False,
     jaccard_threshold: Optional[float] = None,
@@ -835,6 +941,7 @@ def run_audit(
         "total_slides": len(results),
         "threshold": threshold,
         "min_overlap": min_overlap,
+        "summary": summarise_results(results),
         "cadence": audit_cadence(prs, cfg),
         "format_spec": {
             "found": report["found"],

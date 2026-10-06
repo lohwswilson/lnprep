@@ -2,12 +2,15 @@
 
 import json
 import os
+import re
 import shutil
 import tempfile
+
 import pytest
 from pptx import Presentation
 from typer.testing import CliRunner
 
+from lnprep import __version__ as lnprep_version
 from lnprep.main import app
 
 runner = CliRunner()
@@ -28,20 +31,40 @@ def test_environment():
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def plain(text: str) -> str:
+    """Rich output with ANSI styling stripped.
+
+    Rich wraps to the detected terminal width, which differs between a wide local
+    terminal and CI, so assertions must not depend on where a line breaks. Command
+    names and single words survive wrapping; phrases with spaces do not.
+    """
+    return ANSI_RE.sub("", text)
+
+
 def test_cli_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "lnprep version 1.0.0" in result.stdout
+    out = plain(result.stdout)
+    assert "lnprep" in out
+    assert "version" in out
+    assert lnprep_version in out
 
 
 def test_cli_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "Usage: lnprep" in result.stdout
-    assert "init" in result.stdout
-    assert "audit" in result.stdout
-    assert "verify" in result.stdout
-    assert "write" in result.stdout
+    out = plain(result.stdout)
+
+    # "Usage: lnprep" is a phrase and can be split across lines; "Usage:" cannot.
+    assert "Usage:" in out
+    for command in (
+        "init", "extract", "generate", "enhance", "audit", "verify", "write",
+        "cross-check", "sync", "brief", "check", "cache",
+    ):
+        assert command in out, f"{command} missing from --help"
     assert "cache" in result.stdout
 
 
@@ -188,8 +211,85 @@ def test_cli_brief(test_environment):
 def test_cli_check(test_environment):
     deck = test_environment["deck"]
     res = runner.invoke(app, ["check", deck, "--json"])
-    # May pass or fail depending on complete quality markers, but exits with structured JSON
     data = json.loads(res.stdout)
     assert "audit" in data
     assert "references" in data
+
+    # The fixture deck has body text but no notes at all, so the audit half must fail
+    # and the gate must report it. Previously audit_failures was always 0 here and the
+    # command exited 0 on any deck, whatever state it was in.
+    assert data["pass"] is False
+    assert data["audit"]["failures"] >= 1
+    assert res.exit_code == 1
+
+
+def test_cli_audit_summary_is_populated(test_environment):
+    """Regression: run_audit returned no 'summary', so this table printed all zeros."""
+    res = runner.invoke(app, ["audit", test_environment["deck"], "--json"])
+    assert res.exit_code == 0
+    summary = json.loads(res.stdout)["summary"]
+    assert sum(summary.values()) == 1
+    assert summary["no_notes"] == 1
+
+
+def _write_guide_module(tmp_dir):
+    session = os.path.join(tmp_dir, "MO9529.Demo", "Session_1")
+    os.makedirs(session)
+    with open(os.path.join(session, "LECTURE_NOTES_GUIDE.md"), "w") as f:
+        f.write(
+            "# Guide\n\n## Session Identity\n\n```yaml\nmodule_code: \"MO9529\"\n"
+            "duration: \"180 min\"\n```\n\n## Suggested Session Flow\n\n"
+            "### Block 1 — Opening (30 min)\n\n## Formatting & Notes Rules\n\n- x\n"
+        )
+    open(os.path.join(session, "Orphan.pptx"), "w").close()
+    return os.path.join(tmp_dir, "MO9529.Demo")
+
+
+def test_cli_cross_check_reports_failure_and_exits_nonzero():
+    """Regression: the command always printed 'status: UNKNOWN' and exited 0, even
+    when the guide's time budget and its file references had both failed."""
+    tmp_dir = tempfile.mkdtemp(prefix="lnprep-cc-test-")
+    try:
+        module = _write_guide_module(tmp_dir)
+        res = runner.invoke(app, ["cross-check", module, "--json"])
+        data = json.loads(res.stdout)
+
+        assert data["status"] == "FAIL"
+        assert res.exit_code == 1
+        assert data["sessions"]["Session_1"]["budget"]["status"] == "FAIL"
+        assert data["sessions"]["Session_1"]["deck"]["status"] == "FAIL"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_cli_extract_reports_deck_total_not_extraction_count():
+    """total_slides must describe the deck, not the extraction.
+
+    Reporting len(slides_data) made `--slide 2` on a 30-slide deck claim
+    "total_slides: 1".
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="lnprep-extract-test-")
+    try:
+        deck = os.path.join(tmp_dir, "three.pptx")
+        prs = Presentation()
+        for i in range(3):
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            slide.shapes.title.text = f"Slide {i + 1}"
+        prs.save(deck)
+
+        res = runner.invoke(app, ["extract", deck, "--slide", "2", "--json"])
+        assert res.exit_code == 0
+        data = json.loads(res.stdout)
+        assert data["total_slides"] == 3
+        assert data["slides_extracted"] == 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_cli_cross_check_rejects_an_unknown_check_name():
+    """An unrecognised --check value used to match no branch and silently run nothing."""
+    result = runner.invoke(app, ["cross-check", os.getcwd(), "--check", "nonsense"])
+    assert result.exit_code == 2
+    combined = result.stdout + getattr(result, "stderr", "")
+    assert "Unknown --check value" in combined
 

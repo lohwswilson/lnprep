@@ -30,11 +30,47 @@ uv pip install -e ".[test]"
 | `lnprep audit <pptx_path>` | Audit Slide Body Coverage (coverage, semantic alignment, quality, depth) |
 | `lnprep verify <pptx_path>` | Verify academic references, DOIs, ISBNs, and live URLs |
 | `lnprep write <pptx_path>` | Safe Direct XML note injection with automated `.bak` backup and verification gate |
-| `lnprep cache <subcommand>` | Query, record, report, or prune the module-level citation cache |
+| `lnprep cache <subcommand>` | Manage the module-level citation cache — `lookup`, `record`, `report`, `prune`, `hit` |
 | `lnprep cross-check <module_path>` | Validate session guides (time budget, assessment linkages, file references) |
 | `lnprep sync <module_path>` | Parse syllabus, MLOs, and assessment briefs from documents |
 | `lnprep brief <pptx_path>` | Build review brief for independent evaluation |
 | `lnprep check <pptx_path>` | Composite pre-flight validation (SBC audit + reference verification) |
+
+## The verification gate
+
+`lnprep write` refuses to inject notes while any reference finding is **blocking**.
+The blocking statuses are:
+
+| Status | Meaning |
+|---|---|
+| `MISMATCH` | The record's author or year contradicts the citation |
+| `NOT_FOUND` | The DOI resolves to nothing |
+| `BROKEN_LINK` | The URL 404s, is a soft-404, or points at a private/loopback host |
+| `EPHEMERAL_URL` | A search-engine redirect link that will expire |
+| `NO_SOURCE` | A `Concrete Example` with no `Sources:` line |
+| `UNRESOLVED` | A citation with no evidence attached to it |
+| `UNREACHABLE` | The check could not run — offline, timeout, rate limit, or proxy |
+
+`UNREACHABLE` is blocking deliberately. A transport failure means the reference was
+never checked, so an offline machine or a Crossref rate limit must not pass a deck
+that a verified citation would pass.
+
+Two escape hatches, both logged:
+
+```bash
+lnprep verify <pptx> --offline                  # report without touching the network
+lnprep write <pptx> 3 --notes "..." --allow-unverified   # override, logged to .reference_overrides.log
+```
+
+## Safety model for `write`
+
+- A **verified backup** is written before any modification; freshness is decided by
+  content hash, so a deck replaced by a copy-based restore still gets a new backup.
+- Notes are injected into a **private per-invocation staging copy**, never the original.
+- Publishing is **atomic** (`os.replace` + `fsync`) and refused outright if the deck
+  changed on disk while notes were being written — so an edit made in PowerPoint is
+  never silently discarded.
+- Empty note payloads are rejected rather than erasing a slide's existing notes.
 
 ## Development & Testing
 
@@ -44,4 +80,7 @@ uv run pytest
 
 # Run linting
 uv run ruff check
+
+# With coverage
+uv run pytest --cov=lnprep --cov-report=term-missing
 ```

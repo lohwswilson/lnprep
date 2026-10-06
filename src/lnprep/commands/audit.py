@@ -10,13 +10,11 @@ from typing import Optional
 import typer
 from rich.table import Table
 
-from lnprep.console import console, print_formatted, print_success
-from lnprep.core.audit_engine import run_audit
+from lnprep.config import DEFAULT_ALIGNMENT_THRESHOLD, DEFAULT_MIN_OVERLAP
+from lnprep.console import console, print_formatted, print_info, print_success
+from lnprep.core.audit_engine import AUDIT_STATUSES, run_audit
 
-app = typer.Typer(help="Audit lecture notes for SBC coverage, alignment, quality, and depth")
 
-
-@app.callback(invoke_without_command=True)
 def audit_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(
@@ -34,13 +32,13 @@ def audit_command(
         help="Audit a single slide (1-indexed)",
     ),
     threshold: float = typer.Option(
-        0.35,
+        DEFAULT_ALIGNMENT_THRESHOLD,
         "--threshold",
         "-t",
         help="Jaccard similarity threshold for alignment pass",
     ),
     min_overlap: int = typer.Option(
-        3,
+        DEFAULT_MIN_OVERLAP,
         "--min-overlap",
         help="Minimum overlapping content terms required",
     ),
@@ -94,17 +92,22 @@ def audit_command(
     sum_table.add_column("Count", justify="right")
     sum_table.add_column("Description")
 
-    status_styles = {
-        "PASS": ("green", "Full coverage, aligned, ≥5/6 quality markers"),
+    status_desc = {
+        "PASS": ("green", "Full coverage, aligned, quality and depth bars met"),
         "GAPS": ("yellow", "Slide body items missing in SBC section"),
         "MISALIGNED": ("red", "Vocabulary differs significantly from slide"),
         "WEAK_QUALITY": ("red", "Fails 6-marker quality floor"),
+        "SHALLOW_DEPTH": ("red", "SBC fields present but below the paragraph/depth bar"),
+        "WEAK_ZONE_A": ("red", "Zone A KEY POINT present but below the depth bar"),
+        "UNSOURCED_EXAMPLES": ("red", "Concrete Example carries no source"),
         "UNPARSED_SBC": ("red", "SBC section exists but cannot be parsed"),
         "NO_SBC": ("red", "Missing Slide Body Coverage block"),
+        "NO_NOTES": ("red", "Slide has no notes at all"),
         "SKIPPED": ("dim", "Chrome/title slide without substantive body"),
     }
 
-    for st, (style, desc) in status_styles.items():
+    for st in AUDIT_STATUSES:
+        style, desc = status_desc.get(st, ("white", ""))
         cnt = summary.get(st.lower(), 0)
         sum_table.add_row(f"[{style}]{st}[/{style}]", str(cnt), desc)
 
@@ -141,3 +144,30 @@ def audit_command(
         console.print(detail_table)
     else:
         print_success("All audited slides passed SBC structural checks!")
+
+    if depth_summary:
+        rows = [r for r in results if (r.get("depth") or {}).get("fields_checked")]
+        if not rows:
+            print_info("Depth roll-up: no SBC fields were parsed, so there is nothing to summarise.")
+            return
+        console.print()
+        depth_table = Table(title="SBC Depth Roll-up", show_header=True)
+        depth_table.add_column("Slide", style="cyan", width=6)
+        depth_table.add_column("Status")
+        depth_table.add_column("Below / checked", justify="right")
+        depth_table.add_column("Avg paras", justify="right")
+        depth_table.add_column("Below")
+        depth_table.add_column("Over")
+        depth_table.add_column("Not prose")
+        for r in rows:
+            d = r["depth"]
+            depth_table.add_row(
+                str(r["slide"]),
+                str(d.get("status", "—")),
+                f"{d.get('fields_below', 0)} / {d.get('fields_checked', 0)}",
+                str(d.get("average_paragraphs", "—")),
+                ", ".join(d.get("below") or []) or "—",
+                ", ".join(d.get("over") or []) or "—",
+                ", ".join(d.get("not_prose") or []) or "—",
+            )
+        console.print(depth_table)

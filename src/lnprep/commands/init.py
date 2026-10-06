@@ -13,10 +13,7 @@ from rich.table import Table
 from lnprep.console import console, print_formatted, print_success, print_warning
 from lnprep.core.syllabus_sync import generate_guide
 
-app = typer.Typer(help="Initialise LECTURE_NOTES_GUIDE.md for a module folder")
 
-
-@app.callback(invoke_without_command=True)
 def init_command(
     ctx: typer.Context,
     module_path: Path = typer.Argument(

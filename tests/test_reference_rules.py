@@ -1,7 +1,17 @@
 """Tests for reference verification rules and gates."""
 
+import http.server
+import io
 import os
+import shutil
+import socketserver
 import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import pytest
 
 from lnprep.core import audit_engine as sa
 from lnprep.core import common
@@ -109,19 +119,230 @@ def test_statuses_with_stubbed_network(monkeypatch):
 
 def test_write_back_gate():
     deck_dir = tempfile.mkdtemp(prefix="vr-gate-")
-    with open(os.path.join(deck_dir, "LECTURE_NOTES_GUIDE.md"), "w") as f:
-        f.write("# guide\n")
-    deck = os.path.join(deck_dir, "deck.pptx")
-
-    bad = "Item:\n\nConcrete Example: For example, Grab moved 30% more deliveries.\n\nBigger Picture: x"
     devnull = open(os.devnull, "w")
+    try:
+        with open(os.path.join(deck_dir, "LECTURE_NOTES_GUIDE.md"), "w") as f:
+            f.write("# guide\n")
+        deck = os.path.join(deck_dir, "deck.pptx")
 
-    assert vr.gate({1: bad}, deck, out=devnull) is False
-    assert vr.gate({1: bad}, deck, allow_unverified=True, out=devnull) is True
+        bad = "Item:\n\nConcrete Example: For example, Grab moved 30% more deliveries.\n\nBigger Picture: x"
 
-    override_log = os.path.join(deck_dir, vr.OVERRIDE_LOG)
-    assert os.path.exists(override_log)
-    with open(override_log, "r") as f:
-        assert "NO_SOURCE" in f.read()
+        assert vr.gate({1: bad}, deck, out=devnull) is False
+        assert vr.gate({1: bad}, deck, allow_unverified=True, out=devnull) is True
 
-    assert vr.gate({1: 'BRIDGE: "hello"'}, deck, out=devnull) is True
+        override_log = os.path.join(deck_dir, vr.OVERRIDE_LOG)
+        assert os.path.exists(override_log)
+        with open(override_log, "r") as f:
+            assert "NO_SOURCE" in f.read()
+
+        assert vr.gate({1: 'BRIDGE: "hello"'}, deck, out=devnull) is True
+    finally:
+        devnull.close()
+        shutil.rmtree(deck_dir, ignore_errors=True)
+
+
+def test_gate_blocks_when_the_network_is_unreachable(monkeypatch):
+    """A transport failure means the check never happened, so it must block.
+
+    Regression: UNREACHABLE was absent from BLOCKING, so an offline machine, a
+    captive portal, or a Crossref 429 rate-limit produced exactly the same gate
+    decision as a citation that had actually been verified.
+    """
+    def unreachable_doi(*args, **kwargs):
+        return {"status": "UNREACHABLE", "detail": "network: TimeoutError"}
+
+    monkeypatch.setattr(vr, "check_doi", unreachable_doi)
+
+    deck_dir = tempfile.mkdtemp(prefix="vr-gate-")
+    devnull = open(os.devnull, "w")
+    try:
+        with open(os.path.join(deck_dir, "LECTURE_NOTES_GUIDE.md"), "w") as f:
+            f.write("# guide\n")
+        deck = os.path.join(deck_dir, "deck.pptx")
+        notes = {1: "Deep Research:\n- Chor (2023) argued X (doi:10.1234/abc123).\n"}
+
+        rep = vr.verify_notes(notes, cache_root=deck_dir)
+        assert rep["blocking"] >= 1
+        assert "UNREACHABLE" in rep["counts"]
+
+        assert vr.gate(notes, deck, out=devnull) is False
+        # The documented escape hatch still works.
+        assert vr.gate(notes, deck, allow_unverified=True, out=devnull) is True
+    finally:
+        devnull.close()
+        shutil.rmtree(deck_dir, ignore_errors=True)
+
+
+def test_isbn_is_cached_across_slides(monkeypatch):
+    """ISBN had no cache of any kind, so one book cited across 20 slides cost 20
+    OpenLibrary requests — and OpenLibrary rate-limits, which now blocks write-back."""
+    calls = []
+
+    def fake_isbn(isbn, year=None, timeout=0):
+        calls.append(isbn)
+        return {"status": "VERIFIED", "detail": "stub", "evidence": {"title": "Book"}}
+
+    monkeypatch.setattr(vr, "check_isbn", fake_isbn)
+
+    notes = {
+        i: f"Deep Research: Biggs & Tang (2011) ISBN 978-0-273-01913-8 supports item {i}."
+        for i in range(1, 21)
+    }
+    rep = vr.verify_notes(notes, cache_root=None)
+
+    assert len(calls) == 1, f"expected one ISBN lookup, got {len(calls)}"
+    assert rep["counts"].get("VERIFIED", 0) == 20
+
+
+def _fake_open(fail_times, code=429, retry_after=None, body=b'{"message":{"title":["T"],"author":[{"family":"Chor"}],"issued":{"date-parts":[[2023]]}}}'):
+    state = {"n": 0}
+
+    class _Resp(io.BytesIO):
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def geturl(self):
+            return "https://api.crossref.org/works/10.1234/abc"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _open(self, req, timeout=None):
+        if state["n"] < fail_times:
+            state["n"] += 1
+            headers = {"Retry-After": retry_after} if retry_after else {}
+            raise urllib.error.HTTPError(req.full_url, code, "err", headers, None)
+        return _Resp(body)
+
+    return _open
+
+
+def test_fetch_retries_transient_upstream_errors(monkeypatch):
+    """A transient 429 used to surface as UNREACHABLE — which, since the gate became
+    fail-closed, blocked write-back on a momentary blip."""
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(round(s, 2)))
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _fake_open(fail_times=2))
+
+    assert vr.check_doi("10.1234/abc", author="Chor", year="2023")["status"] == "VERIFIED"
+    assert sleeps == [1.0, 2.0], "exponential backoff between attempts"
+
+
+def test_fetch_honours_retry_after(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(round(s, 2)))
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", _fake_open(fail_times=2, retry_after="3")
+    )
+    vr.check_doi("10.1234/abc", author="Chor", year="2023")
+    assert sleeps == [3.0, 3.0]
+
+
+def test_fetch_gives_up_after_the_attempt_cap(monkeypatch):
+    """A persistently failing upstream must still terminate, and still block."""
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _fake_open(fail_times=99))
+
+    assert vr.check_doi("10.1234/abc", author="Chor", year="2023")["status"] == "UNREACHABLE"
+    assert "UNREACHABLE" in vr.BLOCKING, "an unchecked reference must block write-back"
+    assert len(sleeps) == 2, "two backoffs for three attempts"
+
+
+def test_check_doi_survives_non_json_and_malformed_payloads(monkeypatch):
+    """A proxy or captive portal can answer 200 with HTML, and a mirror can return a
+    bare array. Both used to escape as JSONDecodeError/AttributeError — the handler
+    around check_doi catches only network errors — and killed the whole run."""
+    for body in (
+        b"<html><body>Sign in to WiFi</body></html>",   # captive portal interstitial
+        b'["not", "an", "object"]',                      # array, not an object
+        b"{trailing comma,}",                            # malformed
+        b"",                                             # empty
+    ):
+        monkeypatch.setattr(vr, "_fetch", lambda *a, _b=body, **k: (200, "https://x/", "text/html", _b))
+        res = vr.check_doi("10.1234/abc", author="Chor", year="2023")
+        assert res["status"] == "NOT_FOUND", body
+
+    # A well-formed record still resolves.
+    good = b'{"message":{"title":["T"],"author":[{"family":"Chor"}],"issued":{"date-parts":[[2023]]}}}'
+    monkeypatch.setattr(vr, "_fetch", lambda *a, **k: (200, "https://x/", "application/json", good))
+    assert vr.check_doi("10.1234/abc", author="Chor", year="2023")["status"] == "VERIFIED"
+
+
+def test_csl_years_tolerates_malformed_date_blocks():
+    """`(m.get(k) or {}).get(...)` raised whenever a CSL date field was not an object."""
+    assert vr._csl_years({"issued": ["not", "a", "dict"]}) == set()
+    assert vr._csl_years({"issued": {"date-parts": [["nonsense"]]}}) == set()
+    assert vr._csl_years({"issued": {"date-parts": [[2023, 5]]}}) == {2023}
+    assert vr._csl_years({"issued": None}) == set()
+
+
+def test_check_url_refuses_private_loopback_and_metadata_hosts():
+    """Notes are often LLM-authored, so a URL in them is untrusted input.
+
+    Without a host check the tool would fetch loopback, RFC1918 and cloud-metadata
+    addresses from the user's machine and echo the page title back.
+    """
+    for url in (
+        "http://127.0.0.1:8000/secret",
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "http://10.0.0.5/admin",
+        "http://192.168.1.1/",
+        "http://[::1]:9000/",
+        "http://localhost:8080/",
+        "file:///etc/hosts",
+    ):
+        res = vr.check_url(url)
+        assert res["status"] == "BROKEN_LINK", url
+        assert "refused" in res["detail"], url
+
+
+def test_fetch_blocks_a_redirect_into_a_private_address(monkeypatch):
+    """A public URL must not be able to bounce the fetcher into loopback or metadata."""
+    real_is_public = vr._is_public_host
+    # Relax only the first hop so the local test server is reachable; every redirect
+    # target still goes through the real check.
+    monkeypatch.setattr(
+        vr, "_is_public_host", lambda host: True if host == "127.0.0.1" else real_is_public(host)
+    )
+
+    class RedirectToMetadata(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with socketserver.TCPServer(("127.0.0.1", 0), RedirectToMetadata) as srv:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        with pytest.raises(vr.BlockedFetchError, match="blocked address"):
+            vr._fetch(f"http://127.0.0.1:{port}/", timeout=5)
+        srv.shutdown()
+
+
+def test_check_url_fails_closed_on_non_2xx_and_empty_bodies(monkeypatch):
+    """A 3xx out of the redirect loop, or a 2xx with an empty body, used to fall
+    through to VERIFIED and then be written into the cache for 180 days."""
+    monkeypatch.setattr(vr, "_url_is_fetchable", lambda url: (True, ""))
+
+    # 1xx and 3xx are not retrievable pages. (2xx stays VERIFIED provided it has a
+    # body — 299 with content is treated exactly like 200 with content.)
+    for status in (100, 300, 301, 302, 307, 308):
+        monkeypatch.setattr(
+            vr, "_fetch", lambda *a, _s=status, **k: (_s, "https://x/", "text/html", b"<title>x</title>")
+        )
+        assert vr.check_url("https://example.org/a")["status"] == "UNREACHABLE", status
+
+    monkeypatch.setattr(vr, "_fetch", lambda *a, **k: (200, "https://x/", "text/html", b""))
+    assert vr.check_url("https://example.org/a")["status"] == "UNREACHABLE"
+
+    monkeypatch.setattr(
+        vr, "_fetch", lambda *a, **k: (200, "https://x/", "text/html", b"<title>Real Page</title>body")
+    )
+    assert vr.check_url("https://example.org/a")["status"] == "VERIFIED"

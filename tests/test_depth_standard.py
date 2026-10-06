@@ -1,5 +1,9 @@
 """Tests for SBC and Zone A depth standards."""
 
+import os
+
+from pptx import Presentation
+from pptx.util import Inches
 
 from lnprep.core import audit_engine as sa
 
@@ -141,3 +145,168 @@ def test_prose_rules():
     )
     d_ce = sa.audit_sbc_depth(ce, CFG)
     assert d_ce["items"][0]["paragraphs"] == 1
+
+
+_SBC_FIELDS = [
+    "Plain English", "Deep Research", "Concrete Example",
+    "Bigger Picture", "Assessment Link", "Manager's So What",
+]
+_SBC_CFG = {"field_labels": _SBC_FIELDS, "min_paragraphs": 2}
+_COMPLETE_ITEM = """Plain English: A stakeholder is anyone affected by the operation here.
+Deep Research: Freeman (1984) is the seminal study of this mechanism.
+Concrete Example: For example, PSA Tuas Port serves its stakeholders.
+Bigger Picture: Strategically, the consequence for the network matters.
+Assessment Link: This applies in the assignment report you will write.
+Manager's So What: Actionable takeaway: managers should act on this."""
+
+
+def test_trailing_section_does_not_become_a_score_zero_item():
+    """The coverage block must stop before a trailing section.
+
+    It used to run to the end of the lecture text, so a following "Recommended
+    Videos:" heading was parsed as an item with no fields. That scored 0 and dragged
+    a complete slide's average below the quality bar — a false WEAK_QUALITY.
+    """
+    block = "• SLIDE BODY COVERAGE — RISK:\nReal Item:\n" + _COMPLETE_ITEM + "\n"
+    assert sa.audit_sbc_quality(sa.extract_sbc_block(block), _SBC_CFG)["status"] == "PASS"
+
+    with_trailing = block + "\n• RECOMMENDED VIDEOS:\n- Clip 1\n- Clip 2\n"
+    quality = sa.audit_sbc_quality(sa.extract_sbc_block(with_trailing), _SBC_CFG)
+    assert len(quality["items"]) == 1
+    assert quality["status"] == "PASS"
+
+
+def test_sbc_block_starts_at_the_heading_not_a_prose_mention():
+    prose = (
+        "Core Narrative: see the slide body coverage for details of each item.\n"
+        "Unrelated narrative text follows here.\n\n"
+        "• SLIDE BODY COVERAGE — RISK:\nReal Item:\n" + _COMPLETE_ITEM + "\n"
+    )
+    block = sa.extract_sbc_block(prose)
+    assert block.lstrip().upper().startswith("SLIDE BODY COVERAGE")
+
+
+def test_item_header_with_internal_colon_is_still_an_item():
+    """A case-deck bullet such as "Stage 2: Distribution design:" has more than one
+    colon, and the old header rule rejected it — every item then disappeared and the
+    slide was reported as a hard UNPARSED_SBC failure."""
+    block = "• SLIDE BODY COVERAGE — PROCESS:\nStage 2: Distribution design:\n" + _COMPLETE_ITEM + "\n"
+    quality = sa.audit_sbc_quality(sa.extract_sbc_block(block), _SBC_CFG)
+    assert len(quality["items"]) == 1
+    assert quality["status"] == "PASS"
+
+
+def test_bullet_glyphs_other_than_asterisk_are_recognised():
+    """Only "* " counted as a bullet, so a Word/AI "• " item was absorbed."""
+    block = "• SLIDE BODY COVERAGE — RISK:\n• Real Item:\n" + _COMPLETE_ITEM + "\n"
+    items, named = sa.parse_sbc_items(sa.extract_sbc_block(block), _SBC_FIELDS)
+    assert named == 1
+    assert items[0]["label"] == "Real Item:"
+
+
+def test_dash_sub_lines_are_not_promoted_to_items():
+    """ "-" introduces a sub-line within a field, not a new item. Treating it as one
+    split "Deep Research" apart and halved the quality score."""
+    block = (
+        "• SLIDE BODY COVERAGE — RISK:\nReal Item:\n"
+        "Plain English: A stakeholder is anyone affected by the operation here.\n"
+        "Deep Research:\n- Classical Foundation: Freeman (1984) is the seminal study.\n"
+        "- Contemporary Frontier (2024-2026): Recent research describes it.\n"
+        "Concrete Example: For example, PSA Tuas Port serves its stakeholders.\n"
+        "Bigger Picture: Strategically, the consequence for the network matters.\n"
+        "Assessment Link: This applies in the assignment report you will write.\n"
+        "Manager's So What: Actionable takeaway: managers should act on this.\n"
+    )
+    items, named = sa.parse_sbc_items(sa.extract_sbc_block(block), _SBC_FIELDS)
+    assert named == 1
+    assert "Classical Foundation" in items[0]["text"]
+
+
+def test_zone_markers_are_case_insensitive_and_crlf_safe():
+    """Lowercase markers used to put the whole text in the speaker half, so every
+    slide reported NO_SBC with nothing said about why."""
+    notes = (
+        "--- speaker notes ---\nKEY POINT: A real key point sentence.\n\n"
+        "--- visual deconstruction ---\nStep 1: Trace it.\n\n"
+        "--- lecture notes ---\n"
+        "• SLIDE BODY COVERAGE — RISK:\nItem:\nPlain English: A real explanation of the risk.\n"
+    )
+    speaker, lecture = sa.split_speaker_and_lecture(notes)
+
+    assert "KEY POINT" in speaker
+    assert "Step 1" not in speaker, "visual zone must be trimmed out of the speaker half"
+    assert "Plain English: A real explanation" in lecture
+    assert sa.extract_sbc_block(lecture), "SBC block must be found under lowercase markers"
+
+
+def test_zone_split_tolerates_crlf():
+    notes = (
+        "--- SPEAKER NOTES ---\r\nKEY POINT: A real key point sentence.\r\n\r\n"
+        "--- LECTURE NOTES ---\r\n"
+        "• SLIDE BODY COVERAGE — RISK:\r\nItem:\r\nPlain English: A real explanation.\r\n"
+    )
+    speaker, lecture = sa.split_speaker_and_lecture(notes)
+    assert "KEY POINT" in speaker
+    assert sa.extract_sbc_block(lecture)
+
+
+def _deck_with_notes(directory: str, notes: str) -> str:
+    path = os.path.join(directory, "deck.pptx")
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = "Risk: Bullwhip Effect"
+    box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(6), Inches(2))
+    box.text_frame.text = "Bullwhip Effect amplification across tiers"
+    slide.notes_slide.notes_text_frame.text = notes
+    prs.save(path)
+    return path
+
+
+def test_verdict_fails_a_slide_whose_sbc_fields_are_stubs(tmp_path):
+    """Depth and example sourcing must be able to fail the verdict.
+
+    Regression: audit_slide computed depth, Zone A depth and example sourcing and
+    then ignored all three, so a slide whose six SBC fields each held a single
+    word was reported as PASS.
+    """
+    notes = (
+        "--- SPEAKER NOTES ---\nTiming: 5 min\n\n"
+        "KEY POINT: A short but valid key point sentence here.\n\n"
+        "--- VISUAL DECONSTRUCTION ---\n\n"
+        "--- LECTURE NOTES ---\n"
+        "• SLIDE BODY COVERAGE — RISK:\n"
+        "Bullwhip Effect amplification across tiers:\n"
+        "Plain English: is\nDeep Research: research\nConcrete Example: example\n"
+        "Bigger Picture: x\nAssessment Link: y\nManager's So What: z"
+    )
+    result = sa.run_audit(_deck_with_notes(str(tmp_path), notes))["results"][0]
+
+    assert result["depth"]["status"] == "BELOW_DEPTH"
+    assert result["example_sources"]["status"] == "EXAMPLE_UNSOURCED"
+    assert result["status"] == "SHALLOW_DEPTH"
+
+
+def test_run_audit_reports_a_status_summary(tmp_path):
+    """run_audit must return a 'summary' its callers can render.
+
+    Regression: the key did not exist, so `lnprep audit` printed a table of zeros
+    for every status and `lnprep check`'s audit half was unconditionally zero --
+    the composite gate passed decks with no notes at all.
+    """
+    deck = _deck_with_notes(str(tmp_path), "--- LECTURE NOTES ---\nCore Narrative: x\n")
+    res = sa.run_audit(deck)
+
+    assert "summary" in res
+    assert sum(res["summary"].values()) == len(res["results"]) == 1
+    assert res["summary"]["no_sbc"] == 1
+    assert res["summary"]["pass"] == 0
+
+
+def test_summary_counts_every_documented_status():
+    """The summary must carry a bucket for every status audit_slide can emit."""
+    summary = sa.summarise_results(
+        [{"status": s} for s in sa.AUDIT_STATUSES] + [{"status": "PASS"}]
+    )
+    assert set(summary) == {s.lower() for s in sa.AUDIT_STATUSES}
+    assert summary["pass"] == 2
+    assert sum(summary.values()) == len(sa.AUDIT_STATUSES) + 1

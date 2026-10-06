@@ -8,15 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from pptx import Presentation
 from rich.table import Table
 
 from lnprep.console import console, print_formatted, print_success
 from lnprep.core.pptx_engine import extract_notes, extract_slide_images
 
-app = typer.Typer(help="Extract notes and visual metadata from PPTX slides")
 
-
-@app.callback(invoke_without_command=True)
 def extract_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(
@@ -67,13 +65,21 @@ def extract_command(
         return
 
     slides_data = extract_notes(str(pptx_path), output_dir=out_dir_str, slide_filter=slide)
-    data = {"total_slides": len(slides_data), "slides": slides_data}
+    # `total_slides` must describe the deck, not the extraction. Reporting
+    # len(slides_data) made `--slide 2` on a 30-slide deck claim "total_slides: 1".
+    data = {
+        "total_slides": len(Presentation(str(pptx_path)).slides),
+        "slides_extracted": len(slides_data),
+        "slides": slides_data,
+    }
 
     if as_json:
         print_formatted(data, as_json=True)
         return
 
-    print_success(f"Extracted presentation data: {data['total_slides']} slide(s)")
+    print_success(
+        f"Extracted {data['slides_extracted']} of {data['total_slides']} slide(s)"
+    )
 
     table = Table(title="Slide Extraction Summary", show_header=True)
     table.add_column("Slide", style="cyan", width=6)

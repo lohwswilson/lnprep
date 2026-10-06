@@ -12,10 +12,7 @@ import typer
 from lnprep.console import console, print_formatted, print_success
 from lnprep.core.brief_builder import build_brief
 
-app = typer.Typer(help="Assemble review brief for independent reviewer subagent")
 
-
-@app.callback(invoke_without_command=True)
 def brief_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(

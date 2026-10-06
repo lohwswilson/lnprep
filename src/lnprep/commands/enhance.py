@@ -16,10 +16,7 @@ from lnprep.core import citation_db as cc
 from lnprep.core.common import find_guide_file, get_slide_notes_text, load_format_spec, parse_guide
 from lnprep.core.prompt_engine import audit_notes_structure, build_enhancement_prompt
 
-app = typer.Typer(help="Generate targeted enhancement prompts for incomplete slide notes")
 
-
-@app.callback(invoke_without_command=True)
 def enhance_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(
@@ -41,11 +38,6 @@ def enhance_command(
         "--from-gap",
         help="Path to gap scan JSON file",
     ),
-    prompt_only: bool = typer.Option(
-        True,
-        "--prompt-only",
-        help="Output prompt only",
-    ),
     out: Optional[Path] = typer.Option(
         None,
         "--out",
@@ -58,7 +50,10 @@ def enhance_command(
         help="Output JSON summary and prompt",
     ),
 ) -> None:
-    """Generate targeted enhancement prompt for slides with missing structural elements."""
+    """Generate targeted enhancement prompt for slides with missing structural elements.
+
+    House pattern: this emits a prompt and never makes an AI call itself.
+    """
     prs = Presentation(str(pptx_path))
     total_slides = len(prs.slides)
 
