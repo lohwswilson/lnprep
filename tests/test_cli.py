@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import tempfile
 
@@ -9,6 +10,7 @@ import pytest
 from pptx import Presentation
 from typer.testing import CliRunner
 
+from lnprep import __version__ as lnprep_version
 from lnprep.main import app
 
 runner = CliRunner()
@@ -29,20 +31,40 @@ def test_environment():
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def plain(text: str) -> str:
+    """Rich output with ANSI styling stripped.
+
+    Rich wraps to the detected terminal width, which differs between a wide local
+    terminal and CI, so assertions must not depend on where a line breaks. Command
+    names and single words survive wrapping; phrases with spaces do not.
+    """
+    return ANSI_RE.sub("", text)
+
+
 def test_cli_version():
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "lnprep version 1.0.0" in result.stdout
+    out = plain(result.stdout)
+    assert "lnprep" in out
+    assert "version" in out
+    assert lnprep_version in out
 
 
 def test_cli_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "Usage: lnprep" in result.stdout
-    assert "init" in result.stdout
-    assert "audit" in result.stdout
-    assert "verify" in result.stdout
-    assert "write" in result.stdout
+    out = plain(result.stdout)
+
+    # "Usage: lnprep" is a phrase and can be split across lines; "Usage:" cannot.
+    assert "Usage:" in out
+    for command in (
+        "init", "extract", "generate", "enhance", "audit", "verify", "write",
+        "cross-check", "sync", "brief", "check", "cache",
+    ):
+        assert command in out, f"{command} missing from --help"
     assert "cache" in result.stdout
 
 
