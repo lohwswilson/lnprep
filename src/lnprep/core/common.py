@@ -7,6 +7,7 @@ Also provides prompt-side rule text, canonical gold examples, and format spec re
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,9 @@ import yaml
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 # === 3-ZONE CONSTANTS & STRUCTURAL DELIMITERS ===
+# Single source of truth. These literals were previously re-declared in
+# audit_engine, prompt_engine, writer_engine and commands/write.py, so a change to
+# one copy silently desynchronised the others.
 
 ZONE_SPEAKER = "--- SPEAKER NOTES ---"
 ZONE_VISUAL = "--- VISUAL DECONSTRUCTION ---"
@@ -26,6 +30,74 @@ BATCH_SLIDE_SEP = "\n\n---\n\n"
 
 FORMAT_FILENAME = "NOTES_FORMAT.md"
 GUIDE_FILENAME = "LECTURE_NOTES_GUIDE.md"
+
+
+def normalise_newlines(text: str) -> str:
+    """Collapse CRLF and lone CR to LF.
+
+    A guide or spec file last saved by Word on Windows uses CRLF, and every fenced
+    block regex here anchors on a bare "\\n" after the fence — so the file parsed as
+    zero blocks and the module's whole format spec was silently discarded in favour
+    of the built-in default.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def zone_index(text: str, marker: str) -> int:
+    """Case-insensitive index of a zone marker, or -1.
+
+    Markers were matched with a case-sensitive `in`/`str.split`, so a deck (or a
+    model-written payload) using lowercase markers reported NO_SBC on every slide
+    with no diagnostic.
+    """
+    return text.casefold().find(marker.casefold())
+
+
+def has_zone(text: str, marker: str) -> bool:
+    """True if the zone marker appears in the text, ignoring case."""
+    return zone_index(text, marker) >= 0
+
+
+def neutralise_markers(text: str) -> str:
+    """Defuse strings that would forge the batch prompt's structure.
+
+    build_batch_prompt splits slide blocks on SLIDE_START / SLIDE_END, but slide text
+    is interpolated raw. A slide containing those literals could inject content into
+    the shared suffix (slide 1) or have the rest of its own block silently discarded
+    (slides 2..N). The literal is rewritten to a visibly-broken form so the slide's
+    own words still reach the model.
+    """
+    if not text:
+        return text
+    for marker in (SLIDE_START, SLIDE_END):
+        if marker in text:
+            text = text.replace(marker, marker.replace("\n", " / "))
+    return text
+
+
+def split_notes_zones(text: str) -> Tuple[str, str, str]:
+    """Split notes text into (speaker, visual, lecture) parts.
+
+    Splits only on the *first* occurrence of each marker, so a marker quoted inside
+    a body line cannot re-partition the text. Returns ("", "", "") when the lecture
+    marker is absent, which callers treat as "no zones present".
+    """
+    text = normalise_newlines(text)
+    lecture_at = zone_index(text, ZONE_LECTURE)
+    if lecture_at < 0:
+        return "", "", ""
+    head, lecture = text[:lecture_at], text[lecture_at + len(ZONE_LECTURE):]
+
+    speaker_at = zone_index(head, ZONE_SPEAKER)
+    if speaker_at >= 0:
+        head = head[speaker_at + len(ZONE_SPEAKER):]
+
+    visual_at = zone_index(head, ZONE_VISUAL)
+    if visual_at >= 0:
+        speaker, visual = head[:visual_at], head[visual_at + len(ZONE_VISUAL):]
+    else:
+        speaker, visual = head, ""
+    return speaker.strip(), visual.strip(), lecture.strip()
 
 
 # === GUIDE HELPERS ===
@@ -61,7 +133,7 @@ def parse_guide(guide_path: Optional[str]) -> Dict[str, Any]:
 
     try:
         with open(guide_path, "r", encoding="utf-8") as f:
-            content = f.read()
+            content = normalise_newlines(f.read())
     except OSError:
         return {}
 
@@ -497,13 +569,18 @@ def find_format_files(pptx_path: str, max_levels: int = 5) -> List[str]:
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively merge overlay onto base; overlay wins per leaf key."""
-    out = dict(base)
+    """Recursively merge overlay onto base; overlay wins per leaf key.
+
+    Copies deeply. A shallow `dict(base)` shared every nested value with the
+    module-level DEFAULT_FORMAT_SPEC, so one caller mutating a returned spec (e.g.
+    spec["sbc_fields"]) changed the constant for the rest of the process.
+    """
+    out = copy.deepcopy(base)
     for key, val in overlay.items():
         if isinstance(val, dict) and isinstance(out.get(key), dict):
             out[key] = _deep_merge(out[key], val)
         else:
-            out[key] = val
+            out[key] = copy.deepcopy(val)
     return out
 
 
@@ -524,8 +601,76 @@ def spec_dead_knobs(spec: Dict[str, Any]) -> List[Tuple[str, str]]:
     return findings
 
 
+# Keys whose value must have a particular shape. A user spec that gets this wrong
+# used to crash the CLI (None.get, int-not-a-mapping, KeyError on a label-less
+# field entry) rather than degrade to the default.
+_SPEC_TYPES: Dict[str, type] = {
+    "sbc_quality": dict,
+    "audit": dict,
+    "fonts": dict,
+    "_prompt": dict,
+    "zones": dict,
+    "sbc_fields": list,
+    "zone_a_labels": list,
+}
+
+
+def sanitise_spec(loaded: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Drop spec entries with the wrong shape. Returns (clean_spec, errors)."""
+    errors: List[str] = []
+    clean: Dict[str, Any] = {}
+
+    for key, val in loaded.items():
+        expected = _SPEC_TYPES.get(key)
+        if expected is None:
+            clean[key] = val
+            continue
+        if val is None:
+            errors.append(f"'{key}' is empty — ignored, default used")
+        elif not isinstance(val, expected):
+            errors.append(
+                f"'{key}' must be a {expected.__name__}, got {type(val).__name__} — ignored, default used"
+            )
+        else:
+            clean[key] = val
+
+    quality = clean.get("sbc_quality")
+    if isinstance(quality, dict) and "markers" in quality and not isinstance(quality["markers"], dict):
+        errors.append("'sbc_quality.markers' must be a mapping — ignored")
+        quality.pop("markers")
+
+    fields = clean.get("sbc_fields")
+    if isinstance(fields, list):
+        usable = [f for f in fields if isinstance(f, dict) and f.get("label")]
+        dropped = len(fields) - len(usable)
+        if dropped:
+            errors.append(f"sbc_fields: {dropped} entry(ies) lack a 'label' — dropped")
+        if usable:
+            clean["sbc_fields"] = usable
+        else:
+            errors.append("sbc_fields: no usable entries — using the default field set")
+            clean.pop("sbc_fields")
+
+    audit = clean.get("audit")
+    if isinstance(audit, dict):
+        paragraphs = audit.get("paragraphs")
+        if isinstance(paragraphs, dict):
+            bad = [k for k, v in paragraphs.items() if v is not None and not isinstance(v, dict)]
+            for key in bad:
+                paragraphs.pop(key)
+            if bad:
+                errors.append(f"audit.paragraphs: {len(bad)} non-mapping rule(s) dropped: {', '.join(bad)}")
+        min_paras = audit.get("min_paragraphs")
+        if min_paras is not None and not isinstance(min_paras, int):
+            errors.append("audit.min_paragraphs must be an integer — ignored")
+            audit.pop("min_paragraphs")
+
+    return clean, errors
+
+
 def _parse_spec_text(raw: str) -> Dict[str, Any]:
     """Parse a NOTES_FORMAT.md into a dict."""
+    raw = normalise_newlines(raw)
     fence = re.search(r"```ya?ml[ \t]*\n(.*?)```", raw, re.DOTALL)
     return yaml.safe_load(fence.group(1) if fence else raw) or {}
 
@@ -546,7 +691,7 @@ def load_format_spec(pptx_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     }
 
     if not paths:
-        return dict(DEFAULT_FORMAT_SPEC), report
+        return copy.deepcopy(DEFAULT_FORMAT_SPEC), report
 
     loaded_by_path: Dict[str, Any] = {}
     for path in paths:
@@ -561,6 +706,10 @@ def load_format_spec(pptx_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(loaded, dict):
             report["errors"].append(f"{path}: not a YAML mapping")
             continue
+
+        loaded, spec_errors = sanitise_spec(loaded)
+        for msg in spec_errors:
+            report["errors"].append(f"{path}: {msg}")
 
         status = str(loaded.get("status", "active")).strip().lower()
         if status == "draft":
@@ -582,7 +731,7 @@ def load_format_spec(pptx_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     for key in ("sbc_fields", "zone_a_labels"):
         for path in report["bound"]:
             if key in loaded_by_path[path]:
-                spec[key] = loaded_by_path[path][key]
+                spec[key] = copy.deepcopy(loaded_by_path[path][key])
                 report["sources"][key] = path
                 break
 
@@ -594,11 +743,19 @@ def load_format_spec(pptx_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return spec, report
 
 
+def _prompt_block(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """The spec's _prompt mapping, or {} if it is absent or malformed."""
+    prompt = spec.get("_prompt")
+    return prompt if isinstance(prompt, dict) else {}
+
+
 def render_sbc_spec(spec: Dict[str, Any]) -> str:
     """Render the SBC quality-bar prompt text for spec."""
-    prompt = spec.get("_prompt", {})
+    prompt = _prompt_block(spec)
     pieces = [prompt.get("sbc_intro", "")]
-    pieces += [f.get("prompt", "") for f in spec.get("sbc_fields", [])]
+    pieces += [
+        f.get("prompt", "") for f in spec.get("sbc_fields") or [] if isinstance(f, dict)
+    ]
     body = "\n\n".join(p for p in pieces if p)
     outro = prompt.get("sbc_outro", "")
     return f"{body}\n\n{outro}" if outro else body
@@ -606,9 +763,9 @@ def render_sbc_spec(spec: Dict[str, Any]) -> str:
 
 def render_zone_a_spec(spec: Dict[str, Any]) -> str:
     """Render the Zone A hook-spec prompt text for spec."""
-    prompt = spec.get("_prompt", {})
+    prompt = _prompt_block(spec)
     intro = prompt.get("zone_a_intro", "")
-    archetypes = prompt.get("zone_a_archetypes", [])
+    archetypes = prompt.get("zone_a_archetypes") or []
     body = intro + "\n" + "\n".join(a for a in archetypes if a) if archetypes else intro
     outro = prompt.get("zone_a_outro", "")
     return f"{body}\n\n{outro}" if outro else body
@@ -616,7 +773,11 @@ def render_zone_a_spec(spec: Dict[str, Any]) -> str:
 
 def spec_labels_list(spec: Dict[str, Any]) -> List[str]:
     """The full label vocabulary treated as SBC field labels."""
-    labels = [f"{f['label']}:" for f in spec.get("sbc_fields", [])]
+    labels = [
+        f"{f['label']}:"
+        for f in spec.get("sbc_fields") or []
+        if isinstance(f, dict) and f.get("label")
+    ]
     for extra in (
         "Teacher Guidance:", "Questions and Answers:",
         "Academic and Industry References:", "Recommended Videos:",
@@ -635,7 +796,8 @@ def spec_labels_list(spec: Dict[str, Any]) -> List[str]:
 
 def spec_bold_labels(spec: Dict[str, Any]) -> List[str]:
     """Uppercase section labels that get bold-only treatment in Zone A."""
-    labels = [lbl.upper() for lbl in spec.get("zone_a_labels", [])]
+    from_spec = spec.get("zone_a_labels")
+    labels = [str(lbl).upper() for lbl in from_spec] if isinstance(from_spec, list) else []
     for extra in (
         "WARNING:", "CAUTION:", "CONTRAST:", "ANALOGY:", "PUNCHLINE:",
         "FRAMING:", "CASE:", "ADVANTAGES", "DISADVANTAGES",
@@ -651,13 +813,15 @@ def spec_bold_labels(spec: Dict[str, Any]) -> List[str]:
 
 def spec_font_sizes(spec: Dict[str, Any]) -> Dict[str, int]:
     """Font sizes in hundredths of a point (1000 = 10pt)."""
-    fonts = spec.get("fonts", {}) or {}
-    return {
-        "timing": fonts.get("timing", 1100),
-        "header": fonts.get("header", 1000),
-        "body": fonts.get("body", 1000),
-        "sub": fonts.get("sub", 900),
-    }
+    fonts = spec.get("fonts")
+    if not isinstance(fonts, dict):
+        fonts = {}
+    sizes = {"timing": 1100, "header": 1000, "body": 1000, "sub": 900}
+    for key in sizes:
+        value = fonts.get(key)
+        if isinstance(value, int):
+            sizes[key] = value
+    return sizes
 
 
 def split_prompt(prompt: str) -> Tuple[str, str, str]:

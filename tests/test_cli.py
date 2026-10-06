@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+
 import pytest
 from pptx import Presentation
 from typer.testing import CliRunner
@@ -235,6 +236,30 @@ def test_cli_cross_check_reports_failure_and_exits_nonzero():
         assert res.exit_code == 1
         assert data["sessions"]["Session_1"]["budget"]["status"] == "FAIL"
         assert data["sessions"]["Session_1"]["deck"]["status"] == "FAIL"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_cli_extract_reports_deck_total_not_extraction_count():
+    """total_slides must describe the deck, not the extraction.
+
+    Reporting len(slides_data) made `--slide 2` on a 30-slide deck claim
+    "total_slides: 1".
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="lnprep-extract-test-")
+    try:
+        deck = os.path.join(tmp_dir, "three.pptx")
+        prs = Presentation()
+        for i in range(3):
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            slide.shapes.title.text = f"Slide {i + 1}"
+        prs.save(deck)
+
+        res = runner.invoke(app, ["extract", deck, "--slide", "2", "--json"])
+        assert res.exit_code == 0
+        data = json.loads(res.stdout)
+        assert data["total_slides"] == 3
+        assert data["slides_extracted"] == 1
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

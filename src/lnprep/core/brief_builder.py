@@ -32,9 +32,11 @@ from lnprep.core.pptx_engine import extract_slide_images, extract_slide_visuals
 
 def get_rubric_content() -> str:
     """Load the reviewer rubric markdown."""
+    # Only the packaged copy. A machine-local AgentOS path used to be tried second,
+    # which put a personal absolute path in the wheel and gave the rubric a silent
+    # second source that could drift from the shipped one.
     candidate_paths = [
         Path(__file__).resolve().parent.parent / "resources" / "reviewer-rubric.md",
-        Path("/Users/wsloh/AgentOS/skills/teaching/lecture-notes-prep/references/reviewer-rubric.md"),
     ]
     for p in candidate_paths:
         if p.exists():

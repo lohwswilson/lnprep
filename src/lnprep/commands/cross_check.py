@@ -13,8 +13,6 @@ from rich.table import Table
 from lnprep.console import console, print_error, print_formatted, print_success, print_warning
 from lnprep.core.cross_checker import cross_check_module
 
-app = typer.Typer(help="Verify time budget, assessment linkage, LO coverage, and file references")
-
 CHECK_ALIASES = {"los": "lo", "decks": "deck", "readings": "reading"}
 CHECK_NAMES = ("budget", "assessment", "lo", "deck", "reading")
 
@@ -35,7 +33,6 @@ def _check_rows(res):
             yield "(module)", key, check
 
 
-@app.callback(invoke_without_command=True)
 def cross_check_command(
     ctx: typer.Context,
     module_path: Path = typer.Argument(

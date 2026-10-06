@@ -22,12 +22,10 @@ from lnprep.console import (
     print_warning,
 )
 from lnprep.core import ref_verifier as vr
+from lnprep.core.common import ZONE_LECTURE, ZONE_SPEAKER, ZONE_VISUAL
 from lnprep.core.writer_engine import apply_notes, load_notes_payload
 
-app = typer.Typer(help="Write notes to PPTX slides via Direct XML injection with backup and gate")
 
-
-@app.callback(invoke_without_command=True)
 def write_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(
@@ -163,9 +161,9 @@ def write_command(
     for v in res.get("verification", []):
         chk = v.get("checks", {})
         time_ok = "[green]✔[/green]" if chk.get("⏱") else "[red]✘[/red]"
-        spk_ok = "[green]✔[/green]" if chk.get("--- SPEAKER NOTES ---") else "[red]✘[/red]"
-        lec_ok = "[green]✔[/green]" if chk.get("--- LECTURE NOTES ---") else "[red]✘[/red]"
-        vd_ok = "[green]✔[/green]" if chk.get("--- VISUAL DECONSTRUCTION ---") else "[dim]—[/dim]"
+        spk_ok = "[green]✔[/green]" if chk.get(ZONE_SPEAKER) else "[red]✘[/red]"
+        lec_ok = "[green]✔[/green]" if chk.get(ZONE_LECTURE) else "[red]✘[/red]"
+        vd_ok = "[green]✔[/green]" if chk.get(ZONE_VISUAL) else "[dim]—[/dim]"
         v_table.add_row(str(v["slide"]), time_ok, spk_ok, lec_ok, vd_ok)
 
     console.print(v_table)

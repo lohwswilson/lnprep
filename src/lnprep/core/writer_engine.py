@@ -27,11 +27,16 @@ from lxml import etree as ET
 from pptx import Presentation
 
 from lnprep.core.common import (
+    ZONE_LECTURE,
+    ZONE_SPEAKER,
+    ZONE_VISUAL,
     get_slide_notes_text,
     load_format_spec,
+    normalise_newlines,
     spec_bold_labels,
     spec_font_sizes,
     spec_labels_list,
+    zone_index,
 )
 
 ET.register_namespace('p', 'http://schemas.openxmlformats.org/presentationml/2006/main')
@@ -376,16 +381,23 @@ def _inject_notes_into_xml(notes_text: str, xml_path: str, spec: Dict[str, Any],
     for p_el in list(tx_body.findall('a:p', NS)):
         tx_body.remove(p_el)
 
-    parts = notes_text.split("--- LECTURE NOTES ---")
-    speaker_part = parts[0].replace("--- SPEAKER NOTES ---", "").strip()
-    lecture_part = parts[1].strip() if len(parts) > 1 else ""
-
-    if "--- VISUAL DECONSTRUCTION ---" in speaker_part:
-        s_parts = speaker_part.split("--- VISUAL DECONSTRUCTION ---")
-        speaker_part = s_parts[0].strip()
-        visual_part = s_parts[1].strip()
+    # Markers are matched case-insensitively on the first occurrence, and the text is
+    # newline-normalised, so a payload written with lowercase markers or CRLF still
+    # lands in the right zones instead of piling into speaker notes.
+    text = normalise_newlines(notes_text)
+    lecture_at = zone_index(text, ZONE_LECTURE)
+    if lecture_at >= 0:
+        head, lecture_part = text[:lecture_at], text[lecture_at + len(ZONE_LECTURE):].strip()
     else:
-        visual_part = ""
+        head, lecture_part = text, ""
+
+    head = re.sub(re.escape(ZONE_SPEAKER), "", head, flags=re.IGNORECASE)
+    visual_at = zone_index(head, ZONE_VISUAL)
+    if visual_at >= 0:
+        speaker_part = head[:visual_at].strip()
+        visual_part = head[visual_at + len(ZONE_VISUAL):].strip()
+    else:
+        speaker_part, visual_part = head.strip(), ""
 
     paragraphs_to_add: List[ET.Element] = []
 
@@ -735,12 +747,7 @@ def inject_notes(
         # engine never writes reported false failures on otherwise valid payloads.
         item_checks = {
             marker: (marker in written)
-            for marker in (
-                "⏱",
-                "--- SPEAKER NOTES ---",
-                "--- LECTURE NOTES ---",
-                "--- VISUAL DECONSTRUCTION ---",
-            )
+            for marker in ("⏱", ZONE_SPEAKER, ZONE_LECTURE, ZONE_VISUAL)
             if marker in raw_notes
         }
         verification_checks.append({"slide": slide_num, "checks": item_checks})

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install (with test extra)
+        run: uv sync --extra test
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Check the lockfile is current
+        run: uv lock --check
+
+      - name: Test
+        run: uv run pytest -q --cov=lnprep --cov-report=term-missing --cov-fail-under=60

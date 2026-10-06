@@ -18,10 +18,7 @@ from lnprep.core.common import find_guide_file, load_format_spec, parse_guide
 from lnprep.core.pptx_engine import extract_slide_context
 from lnprep.core.prompt_engine import build_batch_prompt, build_generation_prompt, parse_slide_spec
 
-app = typer.Typer(help="Generate lecture note prompts for slides")
 
-
-@app.callback(invoke_without_command=True)
 def generate_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(
@@ -54,11 +51,6 @@ def generate_command(
         "--session",
         help="Session number for context",
     ),
-    prompt_only: bool = typer.Option(
-        True,
-        "--prompt-only",
-        help="Output prompt only (lnprep follows house pattern: no unrequested AI calls)",
-    ),
     out: Optional[Path] = typer.Option(
         None,
         "--out",
@@ -71,7 +63,10 @@ def generate_command(
         help="Output context and prompt as JSON",
     ),
 ) -> None:
-    """Generate structured lecture note prompt for slides."""
+    """Generate structured lecture note prompt for slides.
+
+    House pattern: this emits a prompt and never makes an AI call itself.
+    """
     prs = Presentation(str(pptx_path))
     total_slides = len(prs.slides)
 

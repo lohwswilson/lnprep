@@ -147,6 +147,34 @@ def test_prose_rules():
     assert d_ce["items"][0]["paragraphs"] == 1
 
 
+def test_zone_markers_are_case_insensitive_and_crlf_safe():
+    """Lowercase markers used to put the whole text in the speaker half, so every
+    slide reported NO_SBC with nothing said about why."""
+    notes = (
+        "--- speaker notes ---\nKEY POINT: A real key point sentence.\n\n"
+        "--- visual deconstruction ---\nStep 1: Trace it.\n\n"
+        "--- lecture notes ---\n"
+        "• SLIDE BODY COVERAGE — RISK:\nItem:\nPlain English: A real explanation of the risk.\n"
+    )
+    speaker, lecture = sa.split_speaker_and_lecture(notes)
+
+    assert "KEY POINT" in speaker
+    assert "Step 1" not in speaker, "visual zone must be trimmed out of the speaker half"
+    assert "Plain English: A real explanation" in lecture
+    assert sa.extract_sbc_block(lecture), "SBC block must be found under lowercase markers"
+
+
+def test_zone_split_tolerates_crlf():
+    notes = (
+        "--- SPEAKER NOTES ---\r\nKEY POINT: A real key point sentence.\r\n\r\n"
+        "--- LECTURE NOTES ---\r\n"
+        "• SLIDE BODY COVERAGE — RISK:\r\nItem:\r\nPlain English: A real explanation.\r\n"
+    )
+    speaker, lecture = sa.split_speaker_and_lecture(notes)
+    assert "KEY POINT" in speaker
+    assert sa.extract_sbc_block(lecture)
+
+
 def _deck_with_notes(directory: str, notes: str) -> str:
     path = os.path.join(directory, "deck.pptx")
     prs = Presentation()

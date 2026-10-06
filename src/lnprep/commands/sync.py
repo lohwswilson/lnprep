@@ -12,10 +12,7 @@ from rich.table import Table
 from lnprep.console import console, print_formatted, print_warning
 from lnprep.core.syllabus_sync import parse_syllabus
 
-app = typer.Typer(help="Extract MLOs and assessment tasks from syllabus documents (docx/pdf)")
 
-
-@app.callback(invoke_without_command=True)
 def sync_command(
     ctx: typer.Context,
     module_path: Path = typer.Argument(

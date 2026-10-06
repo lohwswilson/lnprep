@@ -17,13 +17,19 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from lnprep.config import DEFAULT_ALIGNMENT_THRESHOLD, DEFAULT_MIN_OVERLAP
 from lnprep.core.common import (
     DEFAULT_FORMAT_SPEC,
+    PARAGRAPH_RULES,
+    ZONE_LECTURE,
+    ZONE_SPEAKER,
+    ZONE_VISUAL,
     get_slide_notes_text,
     get_slide_title,
     has_visual_content,
     load_format_spec,
-    PARAGRAPH_RULES,
+    normalise_newlines,
+    zone_index,
 )
 from lnprep.core.ref_verifier import check_example_sourcing
 
@@ -103,22 +109,29 @@ def is_chrome(text: str) -> bool:
 
 
 def split_speaker_and_lecture(text: str, speaker_first: bool = True) -> Tuple[str, str]:
-    """Split notes text into (speaker_text, lecture_text)."""
-    sp = "--- SPEAKER NOTES ---"
-    le = "--- LECTURE NOTES ---"
-    vd = "--- VISUAL DECONSTRUCTION ---"
+    """Split notes text into (speaker_text, lecture_text).
 
-    if le in text and sp in text and not speaker_first:
-        i = text.find(sp)
-        speaker_part, lecture_part = text[i + len(sp):], text[:i]
-    elif le in text:
-        parts = text.split(le, 1)
-        speaker_part, lecture_part = parts[0], parts[1]
+    Markers are matched case-insensitively, on the first occurrence only, and the
+    text is newline-normalised first. A case-sensitive `in`/`split` meant a deck
+    using lowercase markers put the whole text in the speaker half and produced
+    NO_SBC for every slide, with nothing said about why.
+    """
+    text = normalise_newlines(text)
+    sp_at = zone_index(text, ZONE_SPEAKER)
+    le_at = zone_index(text, ZONE_LECTURE)
+
+    if le_at >= 0 and sp_at >= 0 and not speaker_first:
+        speaker_part = text[sp_at + len(ZONE_SPEAKER):]
+        lecture_part = text[:sp_at]
+    elif le_at >= 0:
+        speaker_part = text[:le_at]
+        lecture_part = text[le_at + len(ZONE_LECTURE):]
     else:
         speaker_part, lecture_part = text, ""
 
-    if vd in speaker_part:
-        speaker_part = speaker_part.split(vd, 1)[0]
+    vd_at = zone_index(speaker_part, ZONE_VISUAL)
+    if vd_at >= 0:
+        speaker_part = speaker_part[:vd_at]
 
     return speaker_part, lecture_part
 
@@ -230,8 +243,8 @@ def audit_coverage(body_items: List[str], lecture_text: str, cfg: Optional[Dict[
 def audit_alignment(
     body_items: List[str],
     sbc_block: str,
-    threshold: float = 0.10,
-    min_overlap: int = 2,
+    threshold: float = DEFAULT_ALIGNMENT_THRESHOLD,
+    min_overlap: int = DEFAULT_MIN_OVERLAP,
     min_body_terms: int = 6,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -757,8 +770,8 @@ def summarise_results(results: Sequence[Dict[str, Any]]) -> Dict[str, int]:
 def audit_slide(
     slide: Any,
     slide_num: int,
-    threshold: float = 0.10,
-    min_overlap: int = 2,
+    threshold: float = DEFAULT_ALIGNMENT_THRESHOLD,
+    min_overlap: int = DEFAULT_MIN_OVERLAP,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run all SBC audit passes on a single slide."""
@@ -846,8 +859,8 @@ def audit_slide(
 
 def run_audit(
     pptx_path: str,
-    threshold: float = 0.10,
-    min_overlap: int = 2,
+    threshold: float = DEFAULT_ALIGNMENT_THRESHOLD,
+    min_overlap: int = DEFAULT_MIN_OVERLAP,
     slide_num: Optional[int] = None,
     depth_summary: bool = False,
     jaccard_threshold: Optional[float] = None,

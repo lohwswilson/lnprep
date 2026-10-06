@@ -17,10 +17,7 @@ from lnprep.core import ref_verifier as vr
 from lnprep.core.audit_engine import run_audit
 from lnprep.core.common import get_slide_notes_text
 
-app = typer.Typer(help="Composite pre-flight gate: run SBC audit and reference check")
 
-
-@app.callback(invoke_without_command=True)
 def check_command(
     ctx: typer.Context,
     pptx_path: Path = typer.Argument(

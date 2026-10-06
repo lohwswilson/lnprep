@@ -9,26 +9,31 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-from lnprep.core.citation_db import age_days, DEFAULT_TTL_DAYS, normalise_key
+from lnprep.core.citation_db import DEFAULT_TTL_DAYS, age_days, normalise_key
 from lnprep.core.common import (
     BATCH_SLIDE_SEP,
     DEEP_RESEARCH_EVIDENCE_RULE,
     DEFAULT_FORMAT_SPEC,
     EXAMPLE_SOURCES_RULE,
-    extract_slide_body_text,
-    get_slide_title,
-    has_visual_content,
-    KEY_POINT_RULE,
-    PLAIN_ENGLISH_RULE,
-    render_sbc_spec,
-    render_zone_a_spec,
-    SLIDE_END,
-    SLIDE_START,
-    split_prompt,
-    VISUAL_DECONSTRUCTION_RULE,
     GOLD_KEY_POINT_EXAMPLE,
     GOLD_SBC_EXAMPLE,
     GOLD_VISUAL_DECONSTRUCTION_EXAMPLE,
+    KEY_POINT_RULE,
+    PLAIN_ENGLISH_RULE,
+    SLIDE_END,
+    SLIDE_START,
+    VISUAL_DECONSTRUCTION_RULE,
+    ZONE_LECTURE,
+    ZONE_SPEAKER,
+    ZONE_VISUAL,
+    extract_slide_body_text,
+    get_slide_title,
+    has_visual_content,
+    has_zone,
+    neutralise_markers,
+    render_sbc_spec,
+    render_zone_a_spec,
+    split_prompt,
 )
 
 BATCH_INSTRUCTION = """
@@ -142,6 +147,14 @@ def build_generation_prompt(
 ) -> str:
     """Build a structured prompt for single-slide AI note generation."""
     spec = spec or DEFAULT_FORMAT_SPEC
+
+    # Slide text must not be able to forge the batch structure it gets embedded in.
+    slide_context = dict(slide_context)
+    for field in ("title", "body_text", "existing_notes"):
+        value = slide_context.get(field)
+        if isinstance(value, str):
+            slide_context[field] = neutralise_markers(value)
+
     zone_a_spec_text = render_zone_a_spec(spec)
     sbc_spec_text = render_sbc_spec(spec)
     n_fields = len(spec.get("sbc_fields", []))
@@ -484,9 +497,9 @@ def audit_notes_structure(notes_text: str) -> Dict[str, Any]:
     """Audit existing notes for structural completeness."""
     markers = {
         "timing": "⏱" in notes_text,
-        "speaker_section": "--- SPEAKER NOTES ---" in notes_text,
-        "visual_deconstruction": "--- VISUAL DECONSTRUCTION ---" in notes_text,
-        "lecture_section": "--- LECTURE NOTES ---" in notes_text,
+        "speaker_section": has_zone(notes_text, ZONE_SPEAKER),
+        "visual_deconstruction": has_zone(notes_text, ZONE_VISUAL),
+        "lecture_section": has_zone(notes_text, ZONE_LECTURE),
         "bridge": bool(re.search(r"(?:\* )?BRIDGE:", notes_text, re.IGNORECASE)),
         "opening_line": bool(
             re.search(
